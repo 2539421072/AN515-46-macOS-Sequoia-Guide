@@ -1,7 +1,7 @@
 # 暗影骑士·龙 2022 / Acer Nitro 5 AN515-46 安装 macOS 15 Sequoia 与驱动修复全记录
 
 > 一台 **AMD Ryzen 7 6800H + RTX 3060 Laptop** 笔记本的黑苹果完整攻坚记录。
-> 最终：**WiFi、蓝牙（含耳机音频）、触控板与手势、USB、声卡、有线网、键盘、电池、亮度键全部可用**。
+> 最终：**RTX 3060 Laptop 显卡加速（Metal 3 / 内屏 165Hz）、WiFi、蓝牙（含耳机音频）、触控板与手势、USB、声卡、有线网、键盘、电池、亮度键全部可用**。
 > 环境：macOS Sequoia 15.8.2（Darwin 24.6.0）/ OpenCore / SMBIOS `iMacPro1,1`。
 
 这不是一份「照抄 EFI 就能用」的教程，而是一份**排障经验总结**：每一项都写清楚「症状 → 根因 → 具体做法 → 验证命令」，并如实记录走过的弯路。很多坑不是硬件问题，而是**判断方法**的问题，这也是本文最有价值的部分。
@@ -14,6 +14,7 @@
 - [1. 机器与环境](#1-机器与环境)
 - [2. 安装与基础 OpenCore 配置](#2-安装与基础-opencore-配置)
 - [3. 驱动逐项修复](#3-驱动逐项修复)
+  - [3.0 显卡（前置条件）](#30-显卡rtx-3060-laptop--nullmoth-nvidia-驱动前置条件)
 - [4. 启动「玄学」的真正根因：KASLR slide 抽签](#4-启动玄学的真正根因kaslr-slide-抽签)
 - [5. 排障方法论与铁律](#5-排障方法论与铁律)
 - [6. 最终配置快照](#6-最终配置快照)
@@ -32,7 +33,7 @@
 
 | 功能 | 最终状态 | 关键手段 | 验证判据 |
 |---|---|---|---|
-| WiFi（MT7922 / RZ616） | ✅ | `AirportMtkWlan.kext` v1.6.0（fork），`MinKernel=24.2.0` / `MaxKernel=24.99.99` | `system_profiler SPAirPortDataType` 显示 MT7922；实测 400–600 Mbps |
+| **显卡 / 内屏显示 + Metal 加速** | ✅ | **`nullmoth/nvidia-macos-driver` 2.7.2**（kext 装 `/Library/Extensions`，不从 EFI 注入）+ 一组 boot-args / SIP 设置 | `kmutil showloaded \| grep nullmoth` 有 4 行；`SPDisplaysDataType` 显示 `Metal Support: Metal 3` || WiFi（MT7922 / RZ616） | ✅ | `AirportMtkWlan.kext` v1.6.0（fork），`MinKernel=24.2.0` / `MaxKernel=24.99.99` | `system_profiler SPAirPortDataType` 显示 MT7922；实测 400–600 Mbps |
 | 蓝牙（同一张卡，USB `0489:e0e4`） | ✅ | `BlueToolFixup` + `SimpleMtkBtFw` + `SimpleMtkBtPatcher` + 2 个 NVRAM 变量 | `Chipset: THIRD_PARTY_DONGLE` / `State: On` / Address 非空 |
 | 触控板 + 多点手势 | ✅ | VoodooI2C 五件套 + `VoodooI2CHID`，**不需要 ACPI 补丁** | `VoodooI2CHID` / `VoodooInput` 加载，`AppleMultitouchDevice` 注册 |
 | USB（不卡顿） | ✅ | 2 条 `UPCN`/`UPCC` ACPI 补丁 + `XHCILagFix.kext` | `Active=Yes`、`Failure=""`，鼠标 `busy` 数百 ms |
@@ -54,7 +55,7 @@
 | 机型 | Acer Nitro 5 AN515-46（国内名：暗影骑士·龙 2022） |
 | CPU | AMD Ryzen 7 6800H（Rembrandt / Zen3+，8C16T） |
 | 核显 | Radeon 680M（未启用；EFI 里有 `RembrandtGfx.kext` 但未加入 `Kernel/Add`） |
-| 独显 | NVIDIA RTX 3060 Laptop；本环境内屏由第三方 NullMoth 2.7.2 方案驱动 |
+| 独显 | NVIDIA RTX 3060 Laptop（`10de:2520`，6 GB，PCIe x8）；**内屏物理走它**，由 NullMoth 2.7.2 驱动，详见 §3.0 |
 | 内存 / 屏幕 | 32 GB / 1920×1080 @165 Hz |
 | 无线卡 | MediaTek MT7922 / AMD RZ616，M.2 2230，WiFi（PCIe `14c3:0616`）+ 蓝牙（USB `0489:e0e4`）二合一 |
 | 声卡 | Realtek ALC287 |
@@ -62,7 +63,8 @@
 | SMBIOS | `iMacPro1,1` |
 | 引导 | OpenCore（ESP 上 `EFI/OC/`） |
 
-> 关于显卡：本文重点是**驱动修复**，显卡/显示输出的实现细节不在本次记录范围内，请勿据此推断通用做法。请单独参考对应驱动项目的文档。
+> ⚠️ **顺序提醒**：这台机器 BIOS 处于 Discrete GPU only（MUX 硬切），内屏信号由 NVIDIA 独显直接输出。
+> 所以**显卡驱动是安装的前置条件，不是最后才修的一项**——没有它连桌面都看不到，后面所有 kext 调试都无从谈起。先做 §3.0，再做 3.1 起的其他项。
 
 ### 隐私说明
 
@@ -135,13 +137,136 @@ amfi_get_out_of_my_way=0x1 amfi=0x80 ipc_control_port_options=0 \
 gfxrst=4 alcid=13
 ```
 
-其中 `alcid=13` 对应本机 ALC287 的 layout。最终还要在末尾追加固定的 `slide=N`（见 §4），**不要把它写死成 142**。
+拆开看，前面这一大串里**有一半是给显卡的**（详见 §3.0）：
+
+| 参数组 | 用途 |
+|---|---|
+| `nvfb=1 nvaccel=1 nvfbheads=4 -nvkmsnosmooth` | NullMoth 帧缓冲 + 加速器 + 4 个显示头 |
+| `amfi_get_out_of_my_way=0x1 amfi=0x80 ipc_control_port_options=0` | 让 WindowServer 能加载未签名的 Metal 驱动 bundle |
+| `gfxrst=4` | **与 WhateverGreen 共存时必加**，否则开机画面拷贝会读到已释放内存导致 panic |
+| `nvcursor=0` | 本机额外参数（光标相关） |
+| `alcid=13` | 声卡 layout |
+
+最终还要在末尾追加固定的 `slide=N`（见 §4），**不要把它写死成 142**。
+注意 `boot-args` 里**不能**出现 `nv_disable=1`、`-wegnoegpu`、`agdpmod=pikera`——它们会隐藏 NVIDIA 卡。
 
 ---
 
 ## 3. 驱动逐项修复
 
 每一项都按「症状 → 根因 → 做法 → 验证」组织。
+
+### 3.0 显卡：RTX 3060 Laptop + NullMoth NVIDIA 驱动（前置条件）
+
+**为什么必须先做这一项**：这台机器 BIOS 是 Discrete GPU only，内屏通过 MUX 硬连到 NVIDIA 独显。
+AMD Radeon 680M 核显虽然在 PCI 总线上可见（`1002:1681`），但 `No Kext Loaded`，且被
+`disable-gpu=1` 主动禁用。**没有任何显卡驱动 = 没有桌面**，安装盘之后的所有调试都做不了。
+
+**症状（未装驱动时）**：能进系统但只有固件帧缓冲、分辨率固定、无 Metal、WindowServer 无加速，
+或者干脆黑屏。macOS 自带 NVIDIA 驱动早在 Mojave 之后就被移除，Web Driver 也早已停更——传统路线全部无效。
+
+**根因与解法**：用 `nullmoth/nvidia-macos-driver`（**2.7.2**，2026-11-05 发布）。它不是「补个 kext」，
+而是把 NVIDIA 官方开源 GPU 内核模块（r610）移植到 macOS，再叠一套自研 Metal 实现：
+
+```
+Metal app ─► NVMTLDriver.bundle ─► 着色器翻译器 (Apple AIR → SPIR-V)
+          ─► NVK (Mesa Vulkan + NAK 编译器) ─► kexts ─► GPU
+```
+
+| 组件 | 磁盘位置（本机实测均存在） | 作用 |
+|---|---|---|
+| `NVRM.kext` / `NVAccel.kext` / `NVRMFB.kext` / `NVRMAGDC.kext` | `/Library/Extensions/` | 内核侧四个 kext，全部 `2.7.2` |
+| `NVMTLDriver.bundle` | `/Library/GPUBundles/` | Metal 驱动插件 |
+| `nvmtl/` | `/Library/GPUBundles/` | Vulkan 后端（NVK） |
+| GSP 固件 | `/Library/NullMoth/nvfw/nvidia/615.78.08` | NVIDIA 原版固件，未修改 |
+
+> ⚠️ **最容易搞错的一点**：这四个 kext 装在**系统卷** `/Library/Extensions`，由 Auxiliary Kernel Collection 加载。
+> **绝对不要再把它们复制进 `EFI/OC/Kexts` 并从 `Kernel/Add` 注入**——双份加载会冲突。
+> OpenCore 在这里的职责只有两个：设置 SIP 和 boot-args。
+
+#### 3.0.1 OpenCore 必需设置（本机逐项核对过官方 README）
+
+| 位置 | 值 | 为什么 |
+|---|---|---|
+| `NVRAM → Add → csr-active-config` | `430A0000`（Data，即 `0x0A43`） | 允许未签名 kext + root patch；SIP 不能全开 |
+| `Misc → Security → SecureBootModel` | `Disabled` | Apple 安全启动会拒绝非 Apple 签名的 kext |
+| `boot-args` | `nvfb=1 nvaccel=1 nvfbheads=4 -nvkmsnosmooth amfi_get_out_of_my_way=0x1 amfi=0x80 ipc_control_port_options=0` | 帧缓冲 + 加速器 + 4 显示头；AMFI 参数让 WindowServer 加载驱动 bundle |
+| `boot-args` 追加 | `gfxrst=4` | **装了 WhateverGreen 就必加**，否则 NVIDIA 显示打开时 WEG 的开机画面拷贝会读已释放内存 → 内核崩溃 |
+| `Kernel → Add` | `Lilu.kext` + `AMFIPass.kext` 启用 | AMFI 豁免 |
+| `Kernel → Block` | `com.apple.iokit.IONDRVSupport`，`Strategy=Exclude` | 否则固件帧缓冲会抢走 display index 0 |
+| `SMBIOS` | `iMacPro1,1` | 能跑 macOS 15 且带独显的机型（也是官方安装器使用的机型） |
+| `DeviceProperties` | **NVIDIA 卡不需要任何属性** | 官方明确说明；不要抄别人的 `AAPL,ig-platform-id` 之类 |
+| `UEFI → Quirks → ResizeGpuBars` / `Booter → Quirks → ResizeAppleGpuBars` | 保持固件原值（本机均为 `-1`） | 强制改 BAR 会让固件在 picker 之前卡住；**不要照抄别的主板** |
+| BIOS | Above 4G Decoding **ON**、CSM **OFF** | 显卡需要映射 4 GB 以上内存 |
+| 禁止出现 | `nv_disable=1`、`-wegnoegpu`、`agdpmod=pikera`、WhateverGreen 的 NVIDIA 补丁 | 都会隐藏/干扰这张卡 |
+
+同时把这些键列入 `NVRAM → Delete`，让每次启动都重新写入。本机 `DeviceProperties` 里只有三条，
+**没有一条是给 NVIDIA 的**：`acpi-wake-type=1`（网卡唤醒）、`disable-gpu=1`（禁用 AMD 核显）、
+`built-in` + `layout-id`（声卡）。
+
+#### 3.0.2 安装
+
+**推荐**：官方 [1401](https://github.com/nullmoth/1401) Mac app。它会找到启动用的 OpenCore，
+改 config 前逐项展示变更、自动备份，并安装驱动；还会在 OC 启动菜单加一条
+**「1401: Remove NVIDIA driver」**，选它即可在下次启动时完整卸载并还原 config（含 OpenCore 设置）。
+这个一键回滚入口在不稳定机器上非常有价值。
+
+**手动**（自己管理 OpenCore 时）：
+
+```bash
+# 从 Releases 下载 nullmoth-nvidia-<version>.tar.gz
+tar -xzf nullmoth-nvidia-*.tar.gz && cd pkgroot
+shasum -a 256 -c SHA256SUMS      # 每个文件必须 OK
+sudo ./install.sh                # 复制文件并重建 AuxKC
+sudo shutdown -r now             # 必须重启，注销不会加载驱动
+```
+
+首次会卡在 **「PCI configuration end」最长约 1 分钟**（GPU 上电），这是正常的，别急着断电。
+重启后到「系统设置 → 隐私与安全性」**允许这些系统扩展**，然后**再重启一次**。
+本机还有一个 `nullmoth-nv-ok=1` 的 NVRAM 变量，是安装成功标记。
+
+> 官方要求 macOS **15.5+ Sequoia 或 26 Tahoe**、x86_64、Turing 及更新的卡。
+> 开发验证主要在 RTX 5060 上进行；官方 `CARD-SUPPORT.md` 把 **RTX 30 笔记本卡标为 `Pending`**，
+> 也就是说本机属于「实测可用、但不在官方确认表内」。同代不同型号结果可能不同。
+
+#### 3.0.3 验证
+
+```bash
+kmutil showloaded --list-only | grep nullmoth       # 期望 4 行
+kextstat | grep -i nullmoth                         # 4 个 kext，均为 2.7.2
+system_profiler SPDisplaysDataType | head -25       # Metal Support: Metal 3
+```
+
+本机实测输出：
+
+```
+NVIDIA GeForce RTX 3060 Laptop GPU:
+  Vendor: NVIDIA (0x10de)   Device ID: 0x2520   VRAM: 6 GB   Bus: PCIe x8
+  Metal Support: Metal 3
+  Resolution: 1920 x 1080   UI Looks like: 1920 x 1080 @ 165.00Hz
+  Framebuffer Depth: 24-Bit Color (ARGB8888)   Connection Type: Internal   Online: Yes
+
+AMD (0x1002) 0x1681 → Kernel Extension Info: No Kext Loaded   ← 核显按预期禁用
+```
+
+内核日志里的正常渲染证据：`NVMTL over NVIDIA GeForce RTX 3060 Laptop GPU (NVK GA106-A)`、
+`NVRMFB: flipToMemory ... -> ok 1 rc 0`。看到这些就说明 Metal 与窗口合成真的在跑，
+不只是「设备被枚举」。
+
+#### 3.0.4 已知代价与风险
+
+| 项 | 说明 |
+|---|---|
+| **安全性下降** | 未签名 kext 要求 SIP 降到 `0x0A43`、`SecureBootModel=Disabled`。FileVault、DRM、部分系统更新行为会受影响，请自行权衡 |
+| **系统更新后可能失效** | 安装 macOS 安全更新/大版本会重建 AuxKC，驱动可能不再加载，需要重新跑安装器。更新前先整包备份 EFI |
+| **睡眠 / 唤醒** | 官方有专门的 `docs/SLEEP-WAKE.md`；睡醒丢 GPU 时可加 `-nvrmnopm` 让 NVRM 退出电源树 |
+| **画面闪烁 / 撕裂** | 官方建议先试 `-nvrmnoflip`（走拷贝路径，不做零拷贝 scan-out） |
+| **笔记本输出路线** | 官方明确提醒「卡被支持 ≠ 这台笔记本能用」，还要有 NVIDIA 能驱动的输出通路。本机是 MUX 直连内屏，所以成立；**Type-C 视频输出仍无解**（见 §3.8） |
+| **与 WhateverGreen** | 必须 `gfxrst=4`，这是官方点名的 panic 修复 |
+
+可选排障参数还有 `-nvrmnogo`（驱动待命，手动 `nvrmctl go` 启动）、`-nvrmnobootscreen`（不快照开机画面）。
+
+---
 
 ### 3.1 WiFi：MT7922 并非无解
 
@@ -403,7 +528,8 @@ Dortania / OpenCore 配置文档原文：
 
 ## 6. 最终配置快照
 
-**启用 26 个 kext**（顺序即 `Kernel/Add` 顺序）：
+**启用 26 个 kext**（顺序即 `Kernel/Add` 顺序）——注意这里**不包含** NullMoth 的 4 个 kext：
+它们装在系统卷 `/Library/Extensions`，由 AuxKC 加载，不经过 OpenCore。见 §3.0。
 
 ```
  0  Lilu.kext                                    ← 依赖基座 1.7.3
@@ -441,7 +567,9 @@ Dortania / OpenCore 配置文档原文：
 
 > **注意：没有 TPAD / OSYS 补丁。** 见 §3.3。
 
-**NVRAM/Add**：蓝牙两个变量 + boot-args（末尾追加 ` slide=N`）。
+**NVRAM/Add**：蓝牙两个变量 + `csr-active-config = 430A0000` + boot-args（含 §3.0 的显卡参数，末尾追加 ` slide=N`）。
+**Kernel/Block**：`com.apple.iokit.IONDRVSupport` / `Exclude`（显卡必需）。
+**Misc/Security/SecureBootModel**：`Disabled`（显卡必需）。
 **NVRAM/Delete**：同名两个蓝牙变量。
 
 ---
@@ -451,6 +579,11 @@ Dortania / OpenCore 配置文档原文：
 进系统后按顺序跑一遍，任何一项不符就回到对应章节：
 
 ```bash
+# 显卡（最先查：没它就没有桌面）
+kmutil showloaded --list-only | grep nullmoth                 # 期望 4 行
+system_profiler SPDisplaysDataType | grep -E 'Chipset Model|VRAM|Metal Support|UI Looks like'
+nvram nullmoth-nv-ok                                       # 1 = 安装器成功标记
+
 # 蓝牙
 system_profiler SPBluetoothDataType | grep -E 'Chipset:|State:|Address:|Transport:'
 kextstat | grep -iE 'BlueTool|SimpleMtkBt'
@@ -505,6 +638,9 @@ networksetup -setairportpower en2 on     # 接口名用上面查到的实际值
 
 ## 9. 已知问题与后续方向
 
+- [ ] **显卡驱动与系统更新**：macOS 安全更新会重建 AuxKC，更新后需确认 `kmutil ... | grep nullmoth` 仍是 4 行，失效则重跑 1401/install.sh
+- [ ] **睡眠唤醒后的 GPU**：若睡醒丢显卡，试 `-nvrmnopm`；参考官方 `docs/SLEEP-WAKE.md`
+- [ ] **HDMI 外接显示器**：本机只枚举出 2 个 connector（内屏 + HDMI），多屏 / 热插拔行为未系统验证
 - [ ] **摄像头出流**：等 `XHCILagFix` 上游修 iso 重定向（issue #3），或临时关闭它做取舍验证
 - [ ] **Type-C 视频输出**：物理切断，实用解法是 DisplayLink 扩展坞
 - [ ] **右侧 USB-A 的 USB 2.0 通道**：先在 Windows 下对比，判定是硬件还是 ACPI 缺项
@@ -574,12 +710,34 @@ networksetup -setairportpower en2 on     # 接口名用上面查到的实际值
 | └ issue #3 | https://github.com/hbyonly1/XHCILagFix/issues/3 | iso 传输永不完成 = 摄像头 0 帧的根因，作者给了未合并的修法 |
 | AMD-OSX 论坛线索 | 帖名 `amd-rayon-r7-6800h-install-ventura-kernel-panic`（用户 `redhorse1990`） | 最初发现 XHCILagFix 的渠道；**未保存完整 URL，此处不提供猜测地址** |
 
-### 10.5 证据强度说明
+### 10.5 显卡（NullMoth NVIDIA）★ 本次补充
+
+| 项目 / 资料 | 链接 | 结论 |
+|---|---|---|
+| **nullmoth/nvidia-macos-driver** | https://github.com/nullmoth/nvidia-macos-driver | ★ **采用 v2.7.2**：Metal driver for NVIDIA GeForce on macOS Sequoia，源码开放（4193 stars） |
+| └ Releases / v2.7.2 | https://github.com/nullmoth/nvidia-macos-driver/releases/tag/v2.7.2 | 本次所用版本（2026-11-05），含 `nullmoth-nvidia-2.7.2.tar.gz` 与 SHA256SUMS |
+| └ CARD-SUPPORT | https://github.com/nullmoth/nvidia-macos-driver/blob/main/docs/CARD-SUPPORT.md | 支持列表；**RTX 30 笔记本卡标为 `Pending`**，本机属实测可用但非官方确认 |
+| └ TROUBLESHOOTING | https://github.com/nullmoth/nvidia-macos-driver/blob/main/docs/TROUBLESHOOTING.md | 官方排障手册 |
+| └ HOW-IT-WORKS | https://github.com/nullmoth/nvidia-macos-driver/blob/main/docs/HOW-IT-WORKS.md | NVMTLDriver → SPIR-V → NVK → kexts 的结构说明 |
+| └ SLEEP-WAKE | https://github.com/nullmoth/nvidia-macos-driver/blob/main/docs/SLEEP-WAKE.md | 睡眠唤醒与 `-nvrmnopm` |
+| └ CHANGELOG | https://github.com/nullmoth/nvidia-macos-driver/blob/main/CHANGELOG.md | 版本差异（2.7.2 之前改动很多，排障时先确认版本） |
+| **nullmoth/1401** | https://github.com/nullmoth/1401 | 官方安装器（Mac app / 从 Windows 装 macOS），会自动改 OC config 并加「Remove NVIDIA driver」启动项 |
+| laobamac/nvidia-macos-driver | https://github.com/laobamac/nvidia-macos-driver | 早期 fork，仅作对照（2 stars，未采用） |
+| pubglite55/ROG-GU603ZM-Hackintosh | https://github.com/pubglite55/ROG-GU603ZM-Hackintosh | 同为 **RTX 3060 Laptop + Sequoia 15 + NullMoth** 的 EFI 参考 |
+| CGR-MIX/AN515-macOS-Tahoe | https://github.com/CGR-MIX/AN515-macOS-Tahoe | 同系列 AN515 机型 + NullMoth 的 Tahoe 26 案例 |
+| GeekAudio/nm185-diag | https://github.com/GeekAudio/nm185-diag | BAR1 aperture 诊断收集器（排同类问题时参考） |
+| bananan11ss/nullmoth-updater | https://github.com/bananan11ss/nullmoth-updater | 第三方安装/更新器，声称修了 Metal 插件；**未采用**，仅列出 |
+| acidanthera/WhateverGreen | https://github.com/acidanthera/WhateverGreen | 已在 10.1；与 NullMoth 共存时**必须** `gfxrst=4` |
+
+> 本组链接与 §3.0 的全部配置要求，均在 2026-11-07 用官方 README 与本机的
+> `kextstat` / `system_profiler` / `config.plist` 逐项比对过，不是推测。
+
+### 10.6 证据强度说明
 
 | 强度 | 内容 |
 |---|---|
-| **实测（本机）** | 蓝牙三件套 + NVRAM 变量 + 固定 slide 的组合；XHCILagFix 的 `Active=Yes` 与 busy 时间；UPCN/UPCC 补丁；`alcid=13`；VoodooI2C 无补丁可用 |
-| **官方/上游文档** | `slide=value` 使 `ProvideCustomSlide` 失效；`MmioWhitelist` 需 `DevirtualiseMmio=True`；AirportMtkWlan 的 Min/MaxKernel 要求 |
+| **实测（本机）** | NullMoth 2.7.2 的 4 个 kext + Metal 3 / 165Hz 内屏；蓝牙三件套 + NVRAM 变量 + 固定 slide；XHCILagFix 的 `Active=Yes` 与 busy 时间；UPCN/UPCC 补丁；`alcid=13`；VoodooI2C 无补丁可用 |
+| **官方/上游文档** | NullMoth 官方 README 的 boot-args / SIP / Kernel-Block / `gfxrst=4` 要求；`slide=value` 使 `ProvideCustomSlide` 失效；`MmioWhitelist` 需 `DevirtualiseMmio=True`；AirportMtkWlan 的 Min/MaxKernel 要求 |
 | **他人实测案例** | MT7921K/RZ608 在 macOS 15 + iMacPro1,1 完整工作；MT7922 `0489:E0D8` 在 Tahoe 26 能连 BLE；同款 6800H 的机型 AirPods 可连 |
 | **推测 / 未验证** | 摄像头根因指向 XHCILagFix iso 缺陷（未做关 kext 对比）；Type-C 切 Optimus 方案；`DevirtualiseMmio=True` 的效果 |
 

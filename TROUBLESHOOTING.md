@@ -4,18 +4,22 @@
 
 ---
 
-## 0. 先记住三个结论
+## 0. 先记住四个结论
 
 1. **`EXITBS:START` 不是卡死点**。它是 OpenCore 能写的最后一行，成功和失败的日志都以它结尾。看到它不等于卡在这里，失败发生在 XNU 接管之后。
 2. **同一份 config 有时能进有时不能，先怀疑运行时随机量**（slide / 内存布局），不要急着回滚配置。
 3. **设备「突然坏了」时，先查是不是被自己关掉了**。本项目两次大弯路（USB、触控板）都源于排障做减法时关掉 kext 忘记加回。
+4. **「有画面 / 没画面」是一条独立于启动问题的排查线**。NullMoth 显卡 kext 装在系统卷 `/Library/Extensions`、由 AuxKC 加载，**不经过 `EFI/OC/Kexts`**，所以「改 config 做减法」根本影响不到它。黑屏或无 Metal 时按 §11 查，别去动 boot-args 里的 slide。
 
 ---
 
 ## 1. 决策树：系统起不来
 
 ```
-系统起不来
+系统起不来 / 没画面
+│
+├─ 有开机画面但进桌面后黑屏、分辨率固定、无 Metal？
+│   └─ 这是显卡驱动问题，不是启动问题 → 直接跳到 §11
 │
 ├─ 能否进 Windows / Recovery / macOS Installer？
 │   └─ 能 → 挂载 ESP，先看有没有「新日志」
@@ -144,6 +148,9 @@ OpenCore 官方配置文档：
 | `diskutil mount` 报 volume damaged | 「ESP 文件系统损坏」 | `fsck_msdos -n` 往往无错误，用底层 `mount -t msdos` 即可 |
 | `SetupVirtualMap=False` 后能进一次 | 「找到 AMD 固件修复了」 | 该值在本机 True/False 都成功过也都挂过，非决定变量 |
 | Recovery 也卡死 | 「系统卷坏了」 | Recovery 同样会注入第三方 kext，只能排除系统卷，不能排除 kext |
+| 装完系统更新后画面没了 / 无 Metal | 「OpenCore config 被改坏了」 | macOS 更新重建了 AuxKC，`/Library/Extensions` 里的显卡 kext 不再加载；重装驱动即可，与 EFI 无关 |
+| 把 NVRM/NVAccel 等 kext 复制进 `EFI/OC/Kexts` 想「修黑屏」 | 「多注入一份更保险」 | 官方明确禁止：这些 kext 只能从系统卷 AuxKC 加载，双份会冲突 |
+| 首次装驱动时卡在 `PCI configuration end` 约 1 分钟 | 「又死机了，断电重来」 | GPU 上电的正常等待，官方说明最长约 1 分钟 |
 
 ---
 
@@ -157,6 +164,10 @@ VirtualSMC · VoodooPS2 四件套 · WhateverGreen
 ```
 
 本项目用这 9 个成功进了桌面，从而证明问题确实在 kext 层。之后逐项加回（每次一层备份 + 冷/热启动验证）。
+
+> ⚠️ 注意 `WhateverGreen` 被保留在最小集里：它虽不是显卡驱动本体，但与 NullMoth 共存时
+> `boot-args` 里的 `gfxrst=4` 依赖它存在。**真正驱动这张 RTX 3060 的四个 `com.nullmoth.*` kext
+> 不在这张清单里**，它们在系统卷，做减法关不到，也不该去关。
 
 **但这个方法有个致命陷阱**：
 
@@ -268,3 +279,77 @@ for sec in ['ACPI','Booter','DeviceProperties','Misc','PlatformInfo','UEFI']:
 
 > 所以这份手册最想留下的一句话是：
 > **先消除随机性，再谈因果；先用实测定义现象，再去找根因。**
+
+---
+
+## 11. 显卡 / 显示异常速查（与启动排障分开）
+
+主教程 [README.md §3.0](README.md) 有完整安装与配置说明。这里只列「出问题时按什么顺序查」。
+
+**前提认知**：这台机器 BIOS 是 Discrete GPU only，内屏物理走 NVIDIA。显卡驱动失效的表现是
+「黑屏 / 只有固件帧缓冲 / 无 Metal / 分辨率锁死」，**但它和 `EXITBS:START`、slide 抽签毫无关系**。
+两者混在一起查会浪费大量时间。
+
+### 11.1 三条命令先定性
+
+```bash
+kmutil showloaded --list-only | grep nullmoth      # 期望 4 行
+kextstat | grep -i nullmoth                        # 4 个 kext，版本一致
+system_profiler SPDisplaysDataType | grep -E 'Chipset Model|Metal Support|UI Looks like|Kernel Extension Info'
+nvram nullmoth-nv-ok                              # 1 = 安装器成功标记；不存在也可人工核对
+```
+
+| 结果 | 判断 | 下一步 |
+|---|---|---|
+| `kmutil` 0 行，但 `/Library/Extensions/NVRM.kext` 等 4 个文件都在 | AuxKC 没重建 / 系统扩展未被允许 | 系统设置 → 隐私与安全性允许扩展，重启；仍无效则重跑 1401 或 `install.sh` |
+| `kmutil` 4 行，但 `SPDisplaysDataType` 无 Metal | Metal 插件或 AMFI 参数问题 | 核对 `amfi_get_out_of_my_way=0x1 amfi=0x80 ipc_control_port_options=0`、`SecureBootModel=Disabled` |
+| 能看到 NVIDIA 但分辨率固定、无加速 | `Kernel/Block` 缺 `IONDRVSupport / Exclude`，固件帧缓冲抢了 display index 0 | 补上后重启 |
+| 开机立刻 panic，日志提到 WEG / boot screen | 装了 WhateverGreen 却没加 `gfxrst=4` | 补 `gfxrst=4`（官方点名的修复） |
+| 画面闪烁 / 撕裂 | 零拷贝 scan-out 时序 | 先试 `-nvrmnoflip` |
+| 睡眠醒来后 GPU 丢失 | 电源树问题 | `-nvrmnopm`，并读官方 `docs/SLEEP-WAKE.md` |
+| 卡在 `PCI configuration end` | **首次启动正常现象** | 等最多约 1 分钟，不要断电 |
+
+### 11.2 常见配置遗漏（逐项对照官方 README）
+
+```text
+NVRAM/Add/csr-active-config            = 430A0000   (0x0A43，SIP 不能全开)
+Misc/Security/SecureBootModel          = Disabled
+Kernel/Block                           = com.apple.iokit.IONDRVSupport / Exclude
+boot-args 必含                          = nvfb=1 nvaccel=1 nvfbheads=4 -nvkmsnosmooth
+                                         amfi_get_out_of_my_way=0x1 amfi=0x80 ipc_control_port_options=0
+boot-args 有 WhateverGreen 时必加      = gfxrst=4
+boot-args 禁止                          = nv_disable=1 / -wegnoegpu / agdpmod=pikera
+BIOS                                   = Above 4G Decoding ON，CSM OFF
+SMBIOS                                 = iMacPro1,1
+ResizeGpuBars / ResizeAppleGpuBars     = 保持固件原值，不要抄别人的
+DeviceProperties                       = NVIDIA 卡不需要任何属性
+```
+
+**别把显卡 kext 放进 `EFI/OC/Kexts`**。这是与 OpenCore 其他驱动最不同的一点：它们由系统卷的
+Auxiliary Kernel Collection 加载，OpenCore 只负责 SIP 和 boot-args。
+
+### 11.3 系统更新后的恢复流程
+
+macOS 安全更新/大版本会重建 AuxKC，`com.nullmoth.*` 可能不再加载：
+
+```bash
+# 1. 先确认文件还在
+ls -d /Library/Extensions/{NVRM,NVAccel,NVRMFB,NVRMAGDC}.kext
+ls -d /Library/GPUBundles/NVMTLDriver.bundle /Library/GPUBundles/nvmtl
+
+# 2. 重跑官方安装器（推荐，它会同时检查 config）
+#    或手动执行 release 包里的 install.sh，然后重启两次
+
+# 3. 验证
+kmutil showloaded --list-only | grep nullmoth
+```
+
+用 1401 安装的话，OC 启动菜单里那条 **「1401: Remove NVIDIA driver」** 是可逆入口；
+需要临时回到无驱动状态排查时选它，比手工删文件安全得多。
+
+### 11.4 与其他章节的边界
+
+- 如果 **连 OC picker 都看不到**：那是固件/启动项问题，回到 §1 决策树
+- 如果 **picker 能显示、但进系统后黑屏 / 无 Metal**：本节
+- 如果 **画面正常、只是随机起不来**：§3 slide 抽签
+- 如果 **Type-C 接外接屏没信号**：物理 MUX 切断，无解，见 README §3.8，不要试图靠改显卡驱动解决
