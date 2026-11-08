@@ -312,6 +312,37 @@ nvram nullmoth-nv-ok                              # 1 = 安装器成功标记；
 | 睡眠醒来后 GPU 丢失 | 电源树问题 | `-nvrmnopm`，并读官方 `docs/SLEEP-WAKE.md` |
 | 卡在 `PCI configuration end` | **首次启动正常现象** | 等最多约 1 分钟，不要断电 |
 | 屏幕冻在 `-v` 最后一行不动，但 SSH 能进、WindowServer 显示 `state = running` | **AuxKC 里 4 个驱动的路径是畸形的**，驱动一个都没装进去 | 立刻跳到 §11.4，别关 kext、别换 SMBIOS |
+| 同上症状，但 `kmutil showloaded \| grep nullmoth` **是 4 行** | **不是 AuxKC 问题**：`NVRMNVDAFramebuffer` 没挂上，NVKMS 拿不到显示头，WindowServer 只建了个虚拟屏 | **关机 → 拔电源 → 长按电源键 15 秒放电 → 开机**（普通重启无效） |
+
+> **⚠️ 同一个「卡在 -v、没有桌面」有两种完全不同的病，判据只有一条命令：**
+>
+> ```bash
+> kmutil showloaded --list-only | grep -c nullmoth
+> #   0 → AuxKC 路径畸形，去 §11.4
+> #   4 → 继续往下查 framebuffer
+> ```
+>
+> 第二种（framebuffer 竞态）的三行判据：
+>
+> ```bash
+> ioreg -rc NVRMNVDAFramebuffer -w0 | grep -c "class NVRMNVDAFramebuffer"    # 故障 = 0（正常 = 1）
+> ioreg -rc NVRMBootFB -w0 | grep -c "class NVRMBootFB"                       # 故障 = 0
+> sudo log show --last 5m --style compact | grep "display stack"
+> #   正常：display stack: heads 0x1 accel 4 agdc 1 k5 1 iop 1
+> #   故障：display stack: heads 0x0 accel 0 agdc -99 k5 -99 iop -99
+> sudo log show --last 5m --style compact | grep "boot guard"
+> #   正常：boot guard cleared: the framebuffer has its scanout memory and a display mode
+> ```
+>
+> 成因：`NVRMBootFB` 与系统内置的 `IONDRVFramebuffer` 同为 `IOMatchCategory=IOFramebuffer`，一个卡只能挂一个槽位；
+> NV 那几个 kext 在 `/Library/Extensions`、经 AuxKC 加载较晚，**连续快速重启最容易把时序打乱导致抢不到槽位**。
+> 与 config、kext、SMBIOS 全都无关——**所以别再去关 kext 做二分**（这是最容易走偏的地方）。
+>
+> 唯一有效解法：**完全关机 → 拔电源适配器 → 长按电源键 15 秒放电 → 插回电源开机**。
+> 普通 `shutdown -r now`、关机后直接按电源键，都试过无效。
+>
+> 另一个必须知道的保护机制：驱动在 NVRAM 记 `nullmoth-nv-starts`，**连续 2 次启动没拿到显示就永久自禁用**。
+> 排查期间每次重启前先清一次：`sudo nvram -d nullmoth-nv-starts`（保留 `nullmoth-nv-ok=1`）。
 
 ### 11.2 常见配置遗漏（逐项对照官方 README）
 

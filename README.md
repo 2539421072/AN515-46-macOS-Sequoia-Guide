@@ -38,7 +38,8 @@
 
 | 功能 | 最终状态 | 关键手段 | 验证判据 |
 |---|---|---|---|
-| **显卡 / 内屏显示 + Metal 加速** | ✅ | **`nullmoth/nvidia-macos-driver` 2.7.2**（kext 装 `/Library/Extensions`，不从 EFI 注入）+ 一组 boot-args / SIP 设置 | `kmutil showloaded \| grep nullmoth` 有 4 行；`SPDisplaysDataType` 显示 `Metal Support: Metal 3` || WiFi（MT7922 / RZ616） | ✅ 15 / ❌ **26 无解** | 15 用 `AirportMtkWlan.kext` v1.6.0（fork），`MinKernel=24.2.0` / `MaxKernel=24.99.99`；26 的 `IO80211Family` 跳到 1200 版，ABI 不兼容，见 §3.1 | 15：`SPAirPortDataType` 显示 MT7922、实测 400–600 Mbps；26：`kmutil showloaded \| grep -i mtk` 为空 |
+| **显卡 / 内屏显示 + Metal 加速** | ✅ | **`nullmoth/nvidia-macos-driver` 2.7.2**（kext 装 `/Library/Extensions`，不从 EFI 注入）+ 一组 boot-args / SIP 设置 | `kmutil showloaded \| grep nullmoth` 有 4 行；`SPDisplaysDataType` 显示 `Metal Support: Metal 3` |
+| **WiFi（MT7922 / RZ616）** | ✅ 15 / ✅ **26（2026-11-08 跑通）** | 15：`AirportMtkWlan` v1.6.0；**26：`eiyuumiru/SimpleMtkWlan` 的 `AirportMtkWlan` v0.3.0-beta（Tahoe build）**，`MaxKernel` 必须写成 `25.99.99`，详见 §3.1 | 26：`kmutil showloaded \| grep -i airport` 有 1 行、`en2` 拿到 IP、`ping 外网` 0% 丢包 |
 | 蓝牙（同一张卡，USB `0489:e0e4`） | ✅ | `BlueToolFixup` + `SimpleMtkBtFw` + `SimpleMtkBtPatcher` + 2 个 NVRAM 变量 | `Chipset: THIRD_PARTY_DONGLE` / `State: On` / Address 非空 |
 | 触控板 + 多点手势 | ✅ | VoodooI2C 五件套 + `VoodooI2CHID` + **ACPI `TPAD._CRS` 的 OSYS 旁路补丁（必需，见 §3.3）** | `TPAD` 是 `VoodooI2CDeviceNub` 且 `Interrupt Mode = GPIO`；`VoodooI2CPrecisionTouchpadHIDEventDriver` active |
 | USB（不卡顿） | ✅ | 2 条 `UPCN`/`UPCC` ACPI 补丁 + `XHCILagFix.kext` | `Active=Yes`、`Failure=""`，鼠标 `busy` 数百 ms |
@@ -47,7 +48,7 @@
 | 冷启动随机失败 | ✅ 已规避 | boot-args 固定 `slide=<已验证值>` | 日志 `MBA:OUT` 中 slide 恒定，连续启动均成功 |
 | 摄像头出流 | ⚠️ 半通 | 枚举与供电正常，被 `XHCILagFix` 的 iso 缺陷阻塞 | 有设备节点但 0 帧 |
 | Type-C 视频输出 | ❌ 无解 | BIOS 的 Discrete GPU only 物理切断 DP Alt Mode | 只有内屏 + HDMI 两个 connector |
-| 右侧第 4 个 USB-A 的 USB 2.0 通道 | ❌ 未完成 | ACPI 端口表未定义该通道 | 有线鼠标插上零节点，U 盘（USB3）可用 |
+| 右侧第 4 个 USB-A 的 USB 2.0 通道 | ✅ **26 上自己好了**（15 上不行） | 无需补丁：Tahoe 的 USB 栈自己认了这个通道（15 上它在 ACPI 端口表里没定义），详见 §3.4 末 | 有线鼠标插上直接出节点、可用 |
 
 **最重要的一条经验**：这台机器曾经被判定「装蓝牙就必然启动失败」，折腾了一整天；最后发现蓝牙配置从头到尾都是对的，真正的元凶是 **OpenCore 每次启动随机抽取的 KASLR slide 值**。把 slide 固定后，同一份「有毒」的配置一次就成功。详见 [§4](#4-启动玄学的真正根因kaslr-slide-抽签)。
 
@@ -64,9 +65,9 @@
 | 内存 / 屏幕 | 32 GB / 1920×1080 @165 Hz |
 | 无线卡 | MediaTek MT7922 / AMD RZ616，M.2 2230，WiFi（PCIe `14c3:0616`）+ 蓝牙（USB `0489:e0e4`）二合一 |
 | 声卡 | Realtek ALC287 |
-| 系统 | macOS Sequoia 15.8.2 |
-| SMBIOS | `iMacPro1,1` |
-| 引导 | OpenCore（ESP 上 `EFI/OC/`） |
+| 系统 | macOS Sequoia 15.8.2 / **macOS 26.7.2 Tahoe（build `25G332`，Darwin 25.6.0，现主力）** |
+| SMBIOS | 15：`iMacPro1,1`；**26：`MacPro7,1`**（`iMacPro1,1` 会被 Tahoe 的机型检查拒绝，连安装器都进不去） |
+| 引导 | OpenCore。15 与 26 各用一个 ESP（26 用卷名为 `ESP26` 的那个），固件启动项可分别命名 |
 
 > ⚠️ **顺序提醒**：这台机器 BIOS 处于 Discrete GPU only（MUX 硬切），内屏信号由 NVIDIA 独显直接输出。
 > 所以**显卡驱动是安装的前置条件，不是最后才修的一项**——没有它连桌面都看不到，后面所有 kext 调试都无从谈起。先做 §3.0，再做 3.1 起的其他项。
@@ -273,18 +274,23 @@ AMD (0x1002) 0x1681 → Kernel Extension Info: No Kext Loaded   ← 核显按预
 
 ---
 
-### 3.1 WiFi：MT7922 在 Sequoia 可用，在 Tahoe 上无解（2026-11-08 补充）
+### 3.1 WiFi：MT7922 / RZ616（15 与 26 都能用，26 要专用 build）
+
+**结论先行（2026-11-08 更新）**：这块卡在 macOS 15 和 26 上**都能跑通**，但两个系统必须用**不同的 build**，
+选错就表现为「驱动压根不加载」或「扫得到、连不上」。26 上已实测原生 Wi-Fi 菜单 + WPA2 + DHCP + 80 MHz 全通。
 
 **症状**：系统里完全没有 WiFi 接口；网上大量「MT7922 / RZ616 黑苹果无驱动，只能换卡」的说法。
 
 **根因**：上游项目不支持 PCI ID `14c3:0616`，但**社区 fork 已经支持了**。不要用「上游没支持」推断「无解」，先搜 fork 和 PR。
+
+#### macOS 15 Sequoia：`AirportMtkWlan` v1.6.0
 
 **做法**：使用 `AirportMtkWlan.kext` v1.6.0（源自 `e5u/SimpleMtkWlan` 这一分支），加入 `Kernel/Add`：
 
 ```
 BundlePath : AirportMtkWlan.kext
 MinKernel  : 24.2.0
-MaxKernel  : 24.99.99       ← 必须设！装 25.x/Tahoe 版本会直接 panic
+MaxKernel  : 24.99.99       ← 15 上必须锁 24.x；换成 26 的 build 会直接 panic（ABI 不同）
 ```
 
 前提条件（缺一不可）：`DisableIoMapper = true`；`Kernel/Block` 里没有屏蔽 `IOSkywalkFamily`；没有 OCLP 的无线补丁；网卡 `vendor-id` 没被隐藏；主机有 MSI 中断。
@@ -300,26 +306,136 @@ system_profiler SPAirPortDataType | head -30
 # 期望：Firmware 显示 MT7922，协商 780 Mbps，实测 400–600 Mbps
 ```
 
-#### ⚠️ macOS 26 Tahoe：这个 kext 不能用了
+#### ✅ macOS 26 Tahoe：能用了，但要换 build（2026-11-08 实测定型）
 
-升级到 26 之后 WiFi 驱动完全不加载（`kmutil showloaded` 里查不到），容易误判成「配置写错了」。实测排查结论：
+Tahoe 上不是「无解」，而是**三个坑叠在一起**，逐个踩过才能通。
 
-| 检查项 | 结果 |
+**坑 1：`MaxKernel` 写成 `24.99.99`，OpenCore 静默跳过。**
+
+`24` 是 Sequoia 的内核版本，`25` 是 Tahoe。kext 文件放对了、依赖也全，但
+`kmutil showloaded | grep -i airport` 就是空的，`networksetup -listallhardwareports` 里也没有 Wi-Fi 端口，
+日志里只有一句误导性的 `kernelmanager_helper: No bundle at /private/tmp/AirportMtkWlan.kext`。
+
+> **口诀：kext 文件在、依赖满足、但 `kmutil showloaded` 里查不到它 → 先查 `MinKernel` / `MaxKernel`。**
+
+**坑 2：Sequoia build 在 Tahoe 上能加载，但永远 attach 不上。**
+
+`AirportMtkWlan::probe` 在 `init` 之后立刻失败，于是没有 Wi-Fi 接口。原因是 `IO80211Family` 从 15 的 `1000.x`
+跳到 26 的 `1200.13.1`，私有 ABI 变了——**每个 macOS 大版本都必须单独编译**。
+所以「只改 `MaxKernel` 硬放行」没用：放行的是 ABI 不匹配的二进制。
+
+**坑 3（最隐蔽）：assoc 阶段固件进深睡，join 永远超时。**
+
+`Arxusion/AirportMtkWlan` v2.0.0 和更早的 v1.6.0 都有这个 bug：发完 Association Request 后
+**立刻把固件送进深睡**。我们的 AP 要 ~15 ms 才回复，那段回复永远没人接收 → 每次 join 都超时。表现：
+
+- macOS 侧：`assoc status 0x22` / `ieeeStatus 0x3f1`，`networksetup` 报 `-3912`；
+- AP 侧 hostapd：`authenticated` 紧接 **`Station sent an invalid association request`**；
+- 但**连手机热点经常能成功**（Android 的 hostapd 回得快、校验也松），极易误判成「特定 AP 被拒」；
+- 把 AP 从 HE20 降到 HT20（关掉 WiFi 6）**完全无效**，因为根本不是 802.11ax 的问题。
+
+**做法**：换 `eiyuumiru/SimpleMtkWlan` 的 `AirportMtkWlan` **v0.3.0-beta** 的 Tahoe build。
+它的 changelog 逐字命中坑 3：*"The driver put the firmware into deep sleep right after sending the Association
+Request... The firmware now stays awake until the link is up."* 作者开发机就是 RZ616 `14c3:0616` + macOS 26.7.1，与本机同构。
+
+作者提供预编译产物，**不需要自己编**（本机只有 Command Line Tools 也编不了）：
+
+```
+https://github.com/eiyuumiru/SimpleMtkWlan/releases
+→ AirportMtkWlan-Tahoe-v0.3.0-beta.zip    # macOS 26 用这个
+→ mtkctl-v0.3.0-beta.zip                  # 诊断工具，强烈建议一起装
+```
+
+`Kernel/Add` 里这样写：
+
+```
+BundlePath     = AirportMtkWlan.kext
+ExecutablePath = Contents/MacOS/AirportMtkWlan
+PlistPath      = Contents/Info.plist
+Arch           = x86_64
+MinKernel      = 25.0.0        ← 26 必须是 25.x 起点
+MaxKernel      = 25.99.99      ← 少写这一行就前功尽弃（坑 1）
+```
+
+新旧版关键差异：
+
+| | Arxusion v2.0.0（旧） | eiyuumiru v0.3.0-beta（新） |
+|---|---|---|
+| bundle id | `com.flxxxxddd.AirportMtkWlan` | **`com.eiyuumiru.AirportMtkWlan`** 1.0.0 |
+| `IOPCIPrimaryMatch` | 含 `0x061614c3` | 含 `0x061614c3`（`0x796114c3 0x060814c3 0x792214c3 0x061614c3`） |
+| assoc 深睡 bug | **有** | **已修** |
+| 802.11ax | 无 | 可选（boot-arg `amtk_he=1`，默认关） |
+| 依赖 Lilu | 否 | 否 |
+
+前提条件（与 15 相同）：`DisableIoMapper = true`；`Kernel/Block` 里没有屏蔽 `IOSkywalkFamily`；
+没有 OCLP 无线补丁；网卡 `vendor-id` 没被隐藏；**同一张卡只能有一个驱动**
+（`itlwm` / `AirportItlwm` / 以太网风格的 `SimpleMtkWlan` 都要移除）。
+
+**验证（`networksetup` 的 SSID 查询不可靠，别拿它当判据）**：
+
+```bash
+kmutil showloaded --list-only | grep -i airport
+#   期望 1 行：com.eiyuumiru.AirportMtkWlan (1.0.0)
+
+networksetup -listallhardwareports | grep -A2 -i Wi-Fi
+#   期望：Hardware Port: Wi-Fi / Device: en2 / Ethernet Address: <真实 MAC>
+
+ifconfig en2 | grep -E 'status|inet '
+#   期望：status: active 且 inet 有地址
+
+sudo wdutil info | grep -iE 'RSSI|Channel|IPv4|Security'
+#   SSID/BSSID 会被 redact（正常），看 RSSI / Channel / IPv4 即可
+
+sudo /usr/local/bin/mtkctl sta
+#   最准的一行：mode=11ac channel=40 bw=80 rssi=-60 mcs=4 rate=390 bssid=aa:bb:cc:...
+
+# 有线和无线同时在线时，必须绑定出口测，否则测的是有线
+ping -c 3 -S <en2 的 IP> 223.5.5.5
+curl --interface en2 -s -o /dev/null -w '%{http_code}\n' http://www.baidu.com
+```
+
+本机实测（26.7.2 / MacPro7,1，AP = `FAST_EEE864_5G`，这个 AP 用旧版**从来没连上过**）：
+
+| 项目 | 结果 |
 |---|---|
-| `MaxKernel` 是 `24.99.99` | 正常，但 Darwin 25.6.0 不满足 → **被 OpenCore 跳过** |
-| 改成 `25.99.99` 硬放行 | 仍然不加载，说明问题不在版本门 |
-| 依赖 `corecapture`(1.0.4) / `IO80211Family`(1200.13.1) / `IOSkywalkFamily`(1.0) / `IONetworkingFamily`(3.4) | **全都在，版本都够** |
-| `IO80211Family` 版本号 | Sequoia 是 `1000.x`，Tahoe 是 **`1200.13.1`** —— 大版本跳变，私有 API/ABI 变了 |
+| 关联 | 11ac，ch40 / 80 MHz，RSSI -60 dBm，MCS4 → 390 Mbps |
+| IP | `192.168.31.211`（网关/DNS `192.168.31.1`） |
+| ping 网关 / 外网 | 0% 丢包，1.9 ms / 9.6 ms |
+| DNS / HTTP | 7–11 ms；`200`，23 ms |
 
-**结论：不是配置问题，是 ABI 不兼容。** `AirportMtkWlan` 是基于 itlwm 的 `AirportItlwm` 思路、直接使用 `IO80211Family` 私有类的，而 itlwm 上游对每个 macOS 大版本都要单独编译，正是因为这个 ABI 每版都变。原作者把 `MaxKernel` 卡在 `24.99.99` 是有意为之。作者仓库 `flxxxxddd/AirportMtkWlan` 目前已删除，没有 Tahoe 版本。
+**关联成功的日志标志**：`wifip2pd: Infra association ready`。旧版从未出现过这一行，可以直接拿它判定。
 
-**Tahoe 上的三条替代路线，我都评估过，全部不实用：**
+**已知限制**：
 
-1. **原生 `AppleSunriseWLAN.dext`** —— Tahoe 首次内置了 MediaTek 驱动（DriverKit，路径 `/System/Library/DriverExtensions/`），匹配 `14c3:7922` / `0x7923` / `0x7932`，**不含我们这块的 `0x616`**。需要：SSDT 伪装 device-id + 从 KDK 提取 `AppleSunrise.kext`（HAL 层，系统里没有）+ 放 Linux 固件（`WIFI_MT7922_patch_mcu_1_1_hdr.bin`、`WIFI_RAM_CODE_MT7922_1.bin` 改名 `W7922_1.bin`）到 dext 目录 + 关 SIP 和 authenticated-root + 改系统卷后 `bless --create-snapshot`。社区到 2026 年 3 月的进度是：固件能加载、dext 能 attach、WiFi 图标不打叉，但 **`NIC Query V2` 返回 `0xfd`，扫不到任何 SSID，无法连接**。投入极大、结局是只有图标。
-2. **`laobamac/SimpleMtkWlan`** —— 只支持 `14c3:7961` / `0608` / `7922`，**不含 `0616`**，且作者标注 not release-stable、没有发布产物。
-3. **换卡** —— 换 Intel AX210 走 itlwm 也要面对同样的 Tahoe ABI 问题；换 Broadcom 则从 Sonoma 起就已失去原生支持。
+- 不支持 WPA3-SAE（只能用 WPA2）；
+- 不支持 AirDrop / Handoff / AWDL / Continuity（不是原生 Airport 卡）；
+- 无睡眠/唤醒支持，睡醒要重启；
+- 802.11ax 是 experimental 且默认关（要就加 boot-arg `amtk_he=1`，或用 `mtkctl knob 0x1002` 即时关掉）；
+- 无 160 MHz、无 6 GHz；
+- **固件崩了只能断电冷启动恢复**（普通重启无效，`ifconfig en2 down/up` 也救不回来）；
+- 驱动的 SSID 查询接口没实现，`networksetup -getairportnetwork en2` 会误报「未关联」。
 
-**所以这台机器在 macOS 26 上的现实是：用有线网（`RealtekRTL8111` 正常），WiFi 无解。** 如果 WiFi 是刚需，停留在 Sequoia 15 反而是更合理的选择。
+**`mtkctl` 常用命令**（作者随 release 提供，比社区自制的 CLI 可靠）：
+
+```bash
+sudo mtkctl sta           # 当前链路：mode/channel/bw/rssi/mcs/rate/bssid（不含 SSID，可直接贴 issue）
+sudo mtkctl log           # 驱动环形日志
+sudo mtkctl debug         # 调试计数器
+sudo mtkctl knob 0x1002   # 关掉 802.11ax（下次 join 生效）
+```
+
+> ⚠️ **别把它和以太网风格的 `SimpleMtkWlan` 混为一谈。** 后者注册成虚拟以太网卡、要用 `mtkctl join` 自己连；
+> 本机实测**连不上**（`SCAN → ASSOC → INIT` 空转，AP 侧一行日志都不增加，失败后 `SCAN_MANAGER` 卡死在 `HALTED`，
+> `off/on`、`ifconfig down/up` 全救不回来，只能重启）。`AirportMtkWlan` 走 IO80211、用系统原生 Wi-Fi 菜单，是**另一条路**。
+
+**其他几条路线的评估（都不如上面这条）**：
+
+| 路线 | 结论 |
+|---|---|
+| 原生 `AppleSunriseWLAN.dext` 伪装 `0x7922` | Tahoe 首次内置 MediaTek DriverKit 驱动，但只匹配 `7922/7923/7932`，**不含 `0x616`**。需 SSDT 伪装 device-id + 从 KDK 取 `AppleSunrise.kext` + 塞 Linux 固件 + 关 SIP/authenticated-root + 改系统卷 + `bless` 重建快照。社区到 2026-03 的进度是「能 attach、图标不打叉，但 `NIC Query V2` 返回 `0xfd`，扫不到 SSID」。投入极大、结局只有图标，**不建议** |
+| `hbyonly1/itlmt7922-wifi` | itlwm 的 MT7922 移植，带 GUI 客户端，但只标注 macOS 15，26 上未验证 |
+| `watchthelight-labs/WTLMtkWireless` | 项目质量高，但 README 明写 **MT7922/RZ616 不支持**（固件与初始化路径不同），作者建议这类卡暂时用 `SimpleMtkWlan` |
+| 换 Intel AX210 / Broadcom 卡 | AX210 走 itlwm 同样要面对每个大版本重编；Broadcom 从 Sonoma 起已失去原生支持。真要一劳永逸就换 **BCM94360NG**（原生免驱） |
 
 ### 3.2 蓝牙：一次「冤案」与最终解法 ★
 
@@ -489,7 +605,15 @@ ioreg -p IOService -w0 -r -c IOUSBHostDevice | grep "busy"
 
 > ⚠️ 项目自述为 **experimental**，作者只在 Ryzen 9 8945HS / ROG Zephyrus G14 上验证过。本机 6800H 属于同一机理但不在官方验证范围内，实测可用。
 
-**遗留**：右侧第 4 个 USB-A 的 USB 3.0 通道正常（U 盘可用），但 USB 2.0 通道在 ACPI 端口表里根本没定义（有线鼠标插上零节点）。要定性是硬件还是 ACPI 缺项，可在 Windows 下插同一个鼠标对比。
+**右侧第 4 个 USB-A 的 USB 2.0 通道：Sequoia 15 上不行，macOS 26 Tahoe 上自己好了。**
+
+- **15 Sequoia**：该端口的 USB 3.0 通道正常（U 盘可用），但 USB 2.0 通道在 ACPI 端口表里根本没定义，插有线鼠标零节点。
+- **26 Tahoe**：**不做任何额外补丁**，用同一份 `UPCN` / `UPCC` 补丁，这个端口就直接可用了（鼠标插上即出节点、可正常使用）。
+
+推测是 Tahoe 的 USB 栈对「端口表缺项」的枚举处理变了，不再需要人为补那一路 ACPI 描述。
+
+> 这是**实机对比观察**的结论（同一台机器、同一份 EFI、只换系统版本），未做 ACPI 层面的进一步溯源。
+> 也就是说：如果你在 15 上被这个端口困扰，升级到 26 是一个顺带的收益。
 
 ### 3.5 声卡
 
@@ -660,7 +784,7 @@ Dortania / OpenCore 配置文档原文：
  1  BlueToolFixup.kext          2.7.2          ┐
  2  SimpleMtkBtFw.kext          1.1.0          ├ 蓝牙（本次修复）
  3  SimpleMtkBtPatcher.kext     1.1.0          ┘
- 4  AirportMtkWlan.kext         Min=24.2.0 Max=24.99.99   ← WiFi
+ 4  AirportMtkWlan.kext         15: Min=24.2.0 Max=24.99.99 ｜ 26: Min=25.0.0 Max=25.99.99   ← WiFi（26 用 v0.3.0-beta Tahoe build，见 §3.1）
  5  XHCILagFix.kext                           ← USB 不卡顿
  6  AMFIPass.kext               Min=20.0.0
  7  AppleALC.kext                             ← alcid=13
@@ -685,6 +809,9 @@ Dortania / OpenCore 配置文档原文：
 ```
 
 **关闭的条目**（历史遗留，不要动）：`USBToolBox.kext`、`UTBDefault.kext`、`VoodooPS2/PlugIns/VoodooInput.kext`、`USBMap.kext`（文件不存在）、`RTCMemoryFixup.kext`、`RembrandtGfx.kext`（未加入列表）。
+
+> **macOS 26 的差异**：`Kernel/Add` 实际 **32 条**（多了 `SimpleHDA.kext`，紧跟 `AppleALC` 之后——26 删掉了 `AppleHDA.kext`，见 §3.5），
+> 且第 4 条必须是 `eiyuumiru` 的 v0.3.0-beta **Tahoe build**（`Min=25.0.0` / `Max=25.99.99`）。
 
 **ACPI**：3 条 Patch（`_OSI→XOSI` rename、`UPCN`、`UPCC`）+ 4 个启用 SSDT（`SSDT-EC` / `SSDT-PLUG-ALT` / `SSDT-USBX` / `SSDT-XOSI`）。
 `SSDT-USB-Reset.aml` 保持禁用——它在 Darwin 下把 `RHUB._STA` 置 0 会干掉所有 USB 端口。
@@ -712,10 +839,12 @@ nvram nullmoth-nv-ok                                       # 1 = 安装器成功
 system_profiler SPBluetoothDataType | grep -E 'Chipset:|State:|Address:|Transport:'
 kmutil showloaded --list-only | grep -iE 'BlueTool|SimpleMtkBt'
 
-# WiFi
-networksetup -listallhardwareports | grep -A2 -i Wi-Fi
-system_profiler SPAirPortDataType | grep -E 'Card Type|Firmware Version|Status:'
-kmutil showloaded --list-only | grep -iE "airportmtk|itlwm"     # 空 = 驱动没加载（26 上正常）
+# WiFi（26 上：kext 加载 + en2 有 IP 才算通；networksetup 的 SSID 查询不可靠）
+kmutil showloaded --list-only | grep -iE "airportmtk"        # 空 = 没加载 → 先查 MinKernel/MaxKernel（§3.1 坑 1）
+networksetup -listallhardwareports | grep -A2 -i Wi-Fi       # 期望 Hardware Port: Wi-Fi / Device: en2
+ifconfig en2 | grep -E 'status|inet '                        # 期望 status: active 且有 inet 地址
+sudo /usr/local/bin/mtkctl sta                               # 26 上最准：mode/channel/bw/rssi/mcs/bssid
+ping -c 3 -S <en2 的 IP> 223.5.5.5                           # 有线和无线同时在线时必须绑定出口测
 
 # 声卡（26 上必须查两层：有没有控制器，有没有设备）
 kmutil showloaded --list-only | grep -iE "applealc|simplehda"   # 15 上 1 行，26 上 2 行
@@ -779,7 +908,12 @@ networksetup -setairportpower en2 on     # 接口名用上面查到的实际值
 - [ ] **HDMI 外接显示器**：本机只枚举出 2 个 connector（内屏 + HDMI），多屏 / 热插拔行为未系统验证
 - [ ] **摄像头出流**：等 `XHCILagFix` 上游修 iso 重定向（issue #3），或临时关闭它做取舍验证
 - [ ] **Type-C 视频输出**：物理切断，实用解法是 DisplayLink 扩展坞
-- [ ] **右侧 USB-A 的 USB 2.0 通道**：先在 Windows 下对比，判定是硬件还是 ACPI 缺项
+- [x] ~~**右侧 USB-A 的 USB 2.0 通道**~~：**macOS 26 上已自动可用**，无需补丁（15 上缺 ACPI 端口描述，见 §3.4 末）
+- [ ] **WiFi 睡眠唤醒**：`AirportMtkWlan` 目前不支持 sleep/wake，睡醒要重启 → 26 上建议直接关掉睡眠
+- [ ] **WiFi 的 802.11ax**：`amtk_he=1` 仍是 experimental，作者只在极少数 AP 上验证过，默认保持关闭
+- [ ] **WiFi 的 WPA3-SAE**：驱动不支持，只能用 WPA2
+- [ ] **「卡在 -v 日志、没有桌面」**：`NVRMNVDAFramebuffer` 没挂上（日志 `heads 0x0`、`accel 0`），
+      普通重启无效，**必须完全关机 + 拔电源 + 长按电源键 15 秒放电**再开机（详见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)）
 - [ ] **连续多次冷启动验证**：固定 slide 后理论上应每次都进，值得再做一轮压力确认
 - [ ] `DevirtualiseMmio = True` 让白名单生效是否比固定 slide 更优雅（风险中等）
 - [ ] 清理 `NVRAM/Delete` 里遗留的 `rtcfx_exclude` 参数（`RTCMemoryFixup` 已禁用，参数无效）
@@ -818,9 +952,13 @@ networksetup -setairportpower en2 on     # 接口名用上面查到的实际值
 | 项目 | 链接 | 结论 |
 |---|---|---|
 | laobamac/SimpleMtkWlan | https://github.com/laobamac/SimpleMtkWlan | 上游实验版，不支持 `14c3:0616`、无 release |
-| **e5u/SimpleMtkWlan** | https://github.com/e5u/SimpleMtkWlan | ★ **采用**：v1.6.0，README 实测表列有 MT7922 / 460–500 Mbps |
-| flxxxxddd/SimpleMtkWlan | https://github.com/flxxxxddd/SimpleMtkWlan | 同源改进分支；最终 kext 的 bundle id 为 `com.flxxxxddd.AirportMtkWlan` |
+| **eiyuumiru/SimpleMtkWlan** | https://github.com/eiyuumiru/SimpleMtkWlan | ★ **macOS 26 采用**：v0.3.0-beta 的 `AirportMtkWlan-Tahoe` build，**修掉了 assoc 阶段固件深睡导致的 join 超时**；作者开发机就是同款 RZ616 + macOS 26.7.1；随包提供 `mtkctl` 诊断工具。有预编译 release，不需要自己编 |
+| Arxusion/AirportMtkWlan | https://github.com/Arxusion/AirportMtkWlan | v2.0.0 Tahoe build：**手机热点能连、常规 AP 全部 assoc 超时**。issue #5 记录了该现象（同 RZ616 / 26.7.2 / MacPro7,1）但至今零回复，后由上面的 eiyuumiru 分支修掉 |
+| **e5u/SimpleMtkWlan** | https://github.com/e5u/SimpleMtkWlan | ★ **macOS 15 采用**：v1.6.0，README 实测表列有 MT7922 / 460–500 Mbps |
+| flxxxxddd/SimpleMtkWlan | https://github.com/flxxxxddd/SimpleMtkWlan | 同源改进分支；旧 kext 的 bundle id 为 `com.flxxxxddd.AirportMtkWlan`（仓库已删） |
 | e5u/FA608FM-Hackintosh-EFI | https://github.com/e5u/FA608FM-Hackintosh-EFI | 同为 MT7922 的 AMD 笔记本 EFI，配置参考 |
+| hbyonly1/itlmt7922-wifi | https://github.com/hbyonly1/itlmt7922-wifi | itlwm 的 MT7922 移植 + GUI 客户端，只标注 macOS 15，26 上未验证 |
+| watchthelight-labs/WTLMtkWireless | https://github.com/watchthelight-labs/WTLMtkWireless | 质量高，但 README 明写 **MT7922/RZ616 不支持** |
 
 ### 10.3 蓝牙（MT7922 USB `0489:e0e4`）
 
