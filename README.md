@@ -1,12 +1,14 @@
-# 暗影骑士·龙 2022 / Acer Nitro 5 AN515-46 安装 macOS 15 Sequoia 与驱动修复全记录
+# 暗影骑士·龙 2022 / Acer Nitro 5 AN515-46 安装 macOS 15 Sequoia / 26 Tahoe 与驱动修复全记录
 
 > 一台 **AMD Ryzen 7 6800H + RTX 3060 Laptop** 笔记本的黑苹果完整攻坚记录。
 > 最终：**RTX 3060 Laptop 显卡加速（Metal 3 / 内屏 165Hz）、WiFi、蓝牙（含耳机音频）、触控板与手势、USB、声卡、有线网、键盘、电池、亮度键全部可用**。
-> 环境：macOS Sequoia 15.8.2（Darwin 24.6.0）/ OpenCore / SMBIOS `iMacPro1,1`。
+> 环境：macOS Sequoia 15.8.2（Darwin 24.6.0）→ **macOS 26.7.2 Tahoe（build 25G332）** / OpenCore / SMBIOS 15 用 `iMacPro1,1`、26 用 `MacPro7,1`。
 
 这不是一份「照抄 EFI 就能用」的教程，而是一份**排障经验总结**：每一项都写清楚「症状 → 根因 → 具体做法 → 验证命令」，并如实记录走过的弯路。很多坑不是硬件问题，而是**判断方法**的问题，这也是本文最有价值的部分。
 
 > ⚠️ 本文记录的所有结论均来自一台实机的反复验证。不同 BIOS 版本、不同无线卡子型号、不同 macOS 小版本都可能让结果不同。**请务必先整包备份自己的 EFI，再逐项尝试。**
+
+> 📌 **2026-11-08 更新**：本文已验证可在 **macOS 26 Tahoe** 上复现全部结果（触控板 / USB / 硬件加速 / WiFi / 蓝牙 / 声卡）。升级过程踩了两个大坑，单独写在 [§11 AuxKC 路径陷阱](#11-桌面起不来但-windowserver-在跑auxkc-路径陷阱)、[§12 无桌面时离线建账户并开-ssh](#12-没有桌面时怎么进去离线建账户--开-ssh)、[§13 选单排序](#13-opencore-选单顺序没有排序逻辑)。**同时修正了本文一处旧错误：触控板的 ACPI 补丁是必需的（见 §3.3）。**
 
 ## 目录
 
@@ -22,6 +24,9 @@
 - [8. 备份与回滚策略](#8-备份与回滚策略)
 - [9. 已知问题与后续方向](#9-已知问题与后续方向)
 - [10. 参考项目与资料（全部仓库链接）](#10-参考项目与资料全部仓库链接)
+- [11. 桌面起不来但 WindowServer 在跑：AuxKC 路径陷阱](#11-桌面起不来但-windowserver-在跑auxkc-路径陷阱)
+- [12. 没有桌面时怎么进去：离线建账户 + 开 SSH](#12-没有桌面时怎么进去离线建账户--开-ssh)
+- [13. OpenCore 选单顺序没有排序逻辑](#13-opencore-选单顺序没有排序逻辑)
 - [附录 A：ACPI 补丁字节](#附录-aacpi-补丁字节)
 - [附录 B：日志规范化对比脚本](#附录-b日志规范化对比脚本)
 
@@ -35,7 +40,7 @@
 |---|---|---|---|
 | **显卡 / 内屏显示 + Metal 加速** | ✅ | **`nullmoth/nvidia-macos-driver` 2.7.2**（kext 装 `/Library/Extensions`，不从 EFI 注入）+ 一组 boot-args / SIP 设置 | `kmutil showloaded \| grep nullmoth` 有 4 行；`SPDisplaysDataType` 显示 `Metal Support: Metal 3` || WiFi（MT7922 / RZ616） | ✅ | `AirportMtkWlan.kext` v1.6.0（fork），`MinKernel=24.2.0` / `MaxKernel=24.99.99` | `system_profiler SPAirPortDataType` 显示 MT7922；实测 400–600 Mbps |
 | 蓝牙（同一张卡，USB `0489:e0e4`） | ✅ | `BlueToolFixup` + `SimpleMtkBtFw` + `SimpleMtkBtPatcher` + 2 个 NVRAM 变量 | `Chipset: THIRD_PARTY_DONGLE` / `State: On` / Address 非空 |
-| 触控板 + 多点手势 | ✅ | VoodooI2C 五件套 + `VoodooI2CHID`，**不需要 ACPI 补丁** | `VoodooI2CHID` / `VoodooInput` 加载，`AppleMultitouchDevice` 注册 |
+| 触控板 + 多点手势 | ✅ | VoodooI2C 五件套 + `VoodooI2CHID` + **ACPI `TPAD._CRS` 的 OSYS 旁路补丁（必需，见 §3.3）** | `TPAD` 是 `VoodooI2CDeviceNub` 且 `Interrupt Mode = GPIO`；`VoodooI2CPrecisionTouchpadHIDEventDriver` active |
 | USB（不卡顿） | ✅ | 2 条 `UPCN`/`UPCC` ACPI 补丁 + `XHCILagFix.kext` | `Active=Yes`、`Failure=""`，鼠标 `busy` 数百 ms |
 | 声卡（ALC287） | ✅ | `AppleALC` + `alcid=13` | 扬声器 / 耳机 / 内置麦 / Line In 均可选 |
 | 有线网、键盘、电池、亮度键 | ✅ | `RealtekRTL8111` / VoodooPS2 / VirtualSMC 系列 / `BrightnessKeys` | 系统信息里可见 |
@@ -338,35 +343,75 @@ kextstat | grep -iE "BlueTool|SimpleMtkBt"
 
 **备选方案（本次未使用，仅存档）**：`andy-walker-idfa/RZ616-Bluetooth-macOS` 是 `BlueToolFixup` 的 fork，走 SRS / 用户态灌固件路线，二进制里硬编码 `0489:e0d8` 与 `0e8d:0616` 两组 ID。若要用于 `0489:e0e4`，需要改 2 个字节（`d8 e0 → e4 e0`）。该仓库 0 stars、无实测案例、用较新 SDK 编译，**风险中高**，方案一成功后无需再试。
 
-### 3.3 触控板：不需要 ACPI 补丁
+### 3.3 触控板：ACPI OSYS 旁路补丁**是必需的**（2026-11-08 修正）
 
-**症状**：曾出现「触控板完全无反应」，日志里有：
+> ⚠️ **本节此前写错了。** 旧版说「不需要 ACPI 补丁、相关不等于因果」，那个结论是在 macOS 15 上热启动、`OSYS` 恰好被抬高的偶然情况下验证的，把运气当成了规律。macOS 26 冷启动能从反面证明：没有这条补丁，`ELAN050A` 根本建不出 nub。
+
+**症状**：触控板完全无反应，日志里有：
 
 ```
 VoodooI2CDeviceNub::TPAD Could not find an I2C Serial Bus declaration
 Could not initialise nub for ELAN050A
 ```
 
-**走过的一个弯路**：从 DSDT 里解出 `TPAD._CRS` 有 `If (OSYS < 0x07DC) Return (SBFI)` 这样的分支（`SBFI` 只有中断、没有 I2C 地址），于是写了一个 8 字节等长补丁把条件改成恒假：
+**机理**：`TPAD._CRS` 里有这样一个门：
+
+```asl
+If (OSYS < 0x07DC) { Return (SBFI) }     // 老系统走这条
+Return (SBFB + SBFG)                     // 新系统走这条：I2C Serial Bus + GpioInt
+```
+
+`SBFI` 这个 buffer 里**只有 GPIO 中断，没有 I2C 从机地址描述符**，所以 VoodooI2C 拿不到总线地址，nub 建不出来，后面整条链（`VoodooI2CHID` → `VoodooInput` → 触控板）全部断掉。
+
+而 `OSYS` 是个 SystemMemory 字段，由操作系统写进去、靠内存残留维持。**冷启动时它是低值，热启动时可能还留着上一次的高值** —— 这就解释了那种「有时候好有时候坏、重启一次又好了」的随机感。别把它当成 kext 不稳定。
+
+**补丁（8 字节等长，只把比较常量改成 0，让条件恒假）**：
 
 ```
-Find    : 95 4f 53 59 53 0b dc 07    (If OSYS < 0x07DC)
-Replace : 95 4f 53 59 53 0b 00 00    (If OSYS < 0 → 恒假)
+Find    : 95 4F 53 59 53 0B DC 07      ; If (OSYS < 0x07DC)
+Replace : 95 4F 53 59 53 0B 00 00      ; If (OSYS < 0) → 恒假
 ```
 
-加补丁那次触控板确实好了，但后来用**黄金版配置（不含此补丁）**实测：`VoodooI2CHID` + `VoodooInput` 都加载、`AppleMultitouchDevice` 正常注册、30 列传感器齐全。
+字节解读：`4F 53 59 53` = "OSYS"，`0B DC 07` = Integer 0x07DC，`0B 00 00` = Integer 0。前面那个 `95` 是比较操作码。**把比较常量归零，使这个分支不再成立**；DSDT 全表**只命中 1 处**，`Count = 1`，不会误伤。判断补丁是否真生效，**不要看反编译结果，直接看 `ioreg` 里 `Interrupt Mode` 是不是变成了 `GPIO`**。
 
-> **所以这个补丁不是必需的，相关不等于因果。** 当时触控板不工作，真正原因是排障做减法时把 VoodooI2C 五件套关掉了，后来重启顺带完成了 kext 缓存重建。**不建议往 config 里加这条补丁。**
+**前提**：`VoodooGPIO` 必须加载 —— 补丁让 `_CRS` 返回 `SBFG`（GpioInt），而 GpioInt 资源要挂到 `\_SB.GPIO` 上才解析得出来，那个控制器就是 `VoodooGPIO` 提供的。
 
-**正确做法**：保持 VoodooI2C 五件套（`VoodooI2CServices` / `VoodooGPIO` / `VoodooI2C` / `VoodooInput` 插件 / `VoodooI2CHID`）全部启用，且 `Lilu` 在前。
+**正确做法**：五件套全部启用，且顺序上 `Lilu` / `VoodooI2CServices` / `VoodooGPIO` 在 `VoodooI2C` 之前，`VoodooInput` 插件在 `VoodooI2C` 之后：
 
-**验证**：
+```
+Lilu.kext
+VoodooI2C.kext/Contents/PlugIns/VoodooI2CServices.kext
+VoodooI2C.kext/Contents/PlugIns/VoodooGPIO.kext
+VoodooI2C.kext                                  ← 主驱动
+VoodooI2C.kext/Contents/PlugIns/VoodooInput.kext
+VoodooI2CHID.kext
+```
+
+**验证（macOS 26 实测输出，按这个对）**：
 
 ```bash
-kextstat | grep -E "VoodooI2CHID|VoodooInput"
-ioreg -rc AppleMultitouchDevice | grep -c AppleMultitouchDevice
-ioreg -l -w0 | grep -c VoodooI2CDeviceNub
+# 1) nub 建出来了没有 —— 这一条最关键
+ioreg -p IOService -n TPAD -r -d 3
+#   +-o TPAD  <class VoodooI2CDeviceNub, ... registered, matched, active>
+#       "IOName"         = "ELAN050A"
+#       "Interrupt Mode" = "GPIO"        ← 不是 "APIC"，也不是缺失
+#       "gpioPin"        = 9
+#       "i2cAddress"     = 21
+#       "sclHz"          = 400000
+
+# 2) 驱动链起来了没有
+ioreg -c IOHIDDevice -r -w0 | grep -i "magic trackpad"
+#   +-o VoodooI2CPrecisionTouchpadHIDEventDriver <... active>
+#       "Product"      = "Magic Trackpad 2"      ← VoodooInput 的模拟名，不是真苹果硬件
+#       "SerialNumber" = "Voodoo Magic Trackpad 2 Simulator"
+
+# 3) kext 加载情况（macOS 26 上 kextstat 已不推荐，用 kmutil）
+kmutil showloaded --list-only | grep -iE "voodooi2c|voodooinput|voodoogpio"
 ```
+
+**反面判据**：只要 `ioreg -p IOService -n TPAD` 里看不到 `VoodooI2CDeviceNub`，或者 `Interrupt Mode` 不是 `GPIO`，就是补丁没打上 / `VoodooGPIO` 没加载，**跟 kext 版本无关，别去换 VoodooI2C 的版本**。
+
+> 顺带一条纪律：`AppleMultitouchDevice` 注册成功**不能**当成触控板可用的证据。`VoodooInput` 只要加载就会注册那个模拟设备，哪怕一条真实数据都收不到。
 
 ### 3.4 USB：两条 ACPI 补丁 + XHCILagFix
 
@@ -586,23 +631,29 @@ nvram nullmoth-nv-ok                                       # 1 = 安装器成功
 
 # 蓝牙
 system_profiler SPBluetoothDataType | grep -E 'Chipset:|State:|Address:|Transport:'
-kextstat | grep -iE 'BlueTool|SimpleMtkBt'
+kmutil showloaded --list-only | grep -iE 'BlueTool|SimpleMtkBt'
 
 # WiFi
 networksetup -listallhardwareports | grep -A2 -i Wi-Fi
 system_profiler SPAirPortDataType | grep -E 'Card Type|Firmware Version|Status:'
 
-# 触控板
-kextstat | grep -cE 'VoodooI2CHID|VoodooInput'
-ioreg -rc AppleMultitouchDevice | grep -c AppleMultitouchDevice
+# 触控板（两层都要查，缺一不可）
+ioreg -p IOService -n TPAD -r -d 3 | grep -E "VoodooI2CDeviceNub|Interrupt Mode|gpioPin"
+ioreg -c IOHIDDevice -r -w0 | grep -i "magic trackpad"
+kmutil showloaded --list-only | grep -iE "voodooi2c|voodooinput|voodoogpio"   # 期望 5 行
 
-# USB
-ioreg -r -c XHCILagFix -l -w0 | grep -E '"Active"|"Failure"|"Mode"'
-ioreg -p IOService -w0 -r -c IOUSBHostDevice | grep busy
+# USB（唯一判据，别用别的指标替）
+ioreg -r -c XHCILagFix -l -w0 | grep -E '"Active"|"Failure"'
+#   正常：Active = Yes 且 Failure = ""
+#   异常：Active = No / Failure = "waiting for AppleUSBXHCI"  → 补丁没装上
 
-# 启动参数（确认 slide 已固定）
+# 启动参数
 nvram boot-args
 ```
+
+**关于 USB 判据的一点经验**：端口数对不对、设备枚举全不全、日志里没有 error —— **这些全都不能证明 USB 正常**。补丁没装时，这些指标一样漂亮，但鼠标照样延迟三四秒、U 盘只能识别不能读。只有 `Active = Yes / Failure = ""` 才算数。
+
+**关于显卡判据**：`WindowServer` 在跑 ≠ 显卡正常。这个组合（内核起得来、用户态起得来、WindowServer 也在跑、屏幕却冻在 `-v`）几乎都是 AuxKC 里驱动没装进去，去查 `/Library/KernelCollections/AuxiliaryKernelExtensions.kc` 是不是被重建过，见 §11。
 
 一个容易忽略的小问题：MT7922 是 WiFi/蓝牙二合一卡，蓝牙固件上传后偶尔会出现开机时 WiFi 电源为 Off 的情况。驱动和固件都正常，只是电源状态：
 
@@ -736,10 +787,219 @@ networksetup -setairportpower en2 on     # 接口名用上面查到的实际值
 
 | 强度 | 内容 |
 |---|---|
-| **实测（本机）** | NullMoth 2.7.2 的 4 个 kext + Metal 3 / 165Hz 内屏；蓝牙三件套 + NVRAM 变量 + 固定 slide；XHCILagFix 的 `Active=Yes` 与 busy 时间；UPCN/UPCC 补丁；`alcid=13`；VoodooI2C 无补丁可用 |
+| **实测（本机）** | NullMoth 2.7.2 的 4 个 kext + Metal 3 / 165Hz 内屏；蓝牙三件套 + NVRAM 变量 + 固定 slide；XHCILagFix 的 `Active=Yes` 与 busy 时间；UPCN/UPCC 补丁；`alcid=13`；VoodooI2C 五件套 + `TPAD._CRS` OSYS 旁路补丁（`Interrupt Mode = GPIO`）；macOS 26 上 `MacPro7,1` 全功能复现 |
 | **官方/上游文档** | NullMoth 官方 README 的 boot-args / SIP / Kernel-Block / `gfxrst=4` 要求；`slide=value` 使 `ProvideCustomSlide` 失效；`MmioWhitelist` 需 `DevirtualiseMmio=True`；AirportMtkWlan 的 Min/MaxKernel 要求 |
 | **他人实测案例** | MT7921K/RZ608 在 macOS 15 + iMacPro1,1 完整工作；MT7922 `0489:E0D8` 在 Tahoe 26 能连 BLE；同款 6800H 的机型 AirPods 可连 |
 | **推测 / 未验证** | 摄像头根因指向 XHCILagFix iso 缺陷（未做关 kext 对比）；Type-C 切 Optimus 方案；`DevirtualiseMmio=True` 的效果 |
+
+---
+
+## 11. 桌面起不来但 WindowServer 在跑：AuxKC 路径陷阱
+
+这是 macOS 26 (Tahoe) 升级过程中最难的一段，症状具有极强的迷惑性，值得单独成章。
+
+### 11.1 症状组合（记住这个组合，它会重复出现）
+
+- 屏幕永远冻在 `-v` 的最后一行，常见停在 `LUPCIConfigurator::configure() PCI configuration PCI0`；
+- **SSH 能连进来**，内核完全启动，网络、DNS、NTP、APNs 全部正常；
+- `launchctl print system/com.apple.WindowServer` 明确显示 `state = running`；
+- 但 `log show` 里反复出现：
+
+```
+Failed to look up the port for "com.apple.windowserver.active" (1102)
+```
+
+**「内核好 + 用户态好 + WindowServer 在跑 + 屏幕不动」这个组合，指向的几乎一定是 GPU 驱动没加载进 AuxKC，而不是显示配置或 ACPI 的问题。** 别去改 framebuffer、别去换 SMBIOS、更别去关 kext。
+
+### 11.2 根因：`kmutil create` 的 `-p` 参数会剥掉 `-R` 前缀
+
+真正的错误藏在 `kernelmanagerd` 日志里：
+
+```
+Installation check: missing bundle for com.nullmoth.NVRMAGDC at /Users/acer/ - Data/Library/Extensions/NVRMAGDC.kext
+```
+
+注意那个 **`/Users/acer/ - Data/`** —— 这是畸形的。原因：
+
+- 目标系统卷名是 `TAHOE - Data`（APFS Data 卷，名字本身就带空格和连字符）；
+- 跨版本重建时用了 `-R /Volumes/TAHOE -p /Volumes/TAHOE - Data/Library/Extensions/xxx.kext`；
+- `kmutil` 会先用 `-R` 的前缀去剥 `-p` 的路径，剥完剩下 ` - Data/Library/Extensions/xxx.kext`（相对路径）；
+- 再把这个相对路径**拼上当前工作目录** —— 当时 cwd 是 `/Users/acer`，于是得到 `/Users/acer/ - Data/Library/Extensions/xxx.kext`。
+
+这个路径当然不存在，四个驱动全部被拒装。于是：内核起得来、用户态起得来、WindowServer 也起得来，但**拿不到 framebuffer**，屏幕就永远停在那里。
+
+### 11.3 修复：在目标系统本机跑，cwd 必须是 `/`，`-p` 用绝对路径
+
+```bash
+cd /                                    # ← 关键，cwd 必须是 /
+PB=$(ls -d /System/Volumes/Preboot/*/boot | head -1)
+
+sudo kmutil create -n aux -A /tmp/aux-good.kc -R / \
+  -p /Library/Extensions/NVAccel.kext \
+  -p /Library/Extensions/NVRM.kext \
+  -p /Library/Extensions/NVRMAGDC.kext \
+  -p /Library/Extensions/NVRMFB.kext \
+  -k /System/Library/Kernels/kernel \
+  -B "$PB/System/Library/KernelCollections/BootKernelExtensions.kc" \
+  -S /System/Library/KernelCollections/SystemKernelExtensions.kc \
+  --build "$(sw_vers -buildVersion)" \
+  --allow-missing-kdk --no-authentication --no-authorization --force
+
+# 产物约 19–20 MB，装回去
+sudo cp /tmp/aux-good.kc /Library/KernelCollections/AuxiliaryKernelExtensions.kc
+sudo chown root:wheel /Library/KernelCollections/AuxiliaryKernelExtensions.kc
+sudo chmod 744 /Library/KernelCollections/AuxiliaryKernelExtensions.kc
+sudo reboot
+```
+
+**怎么确认修好了**：
+
+```bash
+kmutil showloaded --list-only | grep -c nullmoth          # 4
+ioreg -l -w0 | grep -A2 IOFramebuffer | head -20          # 应出现 NVRMNVDAFramebuffer
+ioreg -l -w0 | grep -c NVMTLDevice                        # Metal 插件类名
+```
+
+### 11.4 三条走不通的路（别再试）
+
+| 做法 | 结果 |
+|---|---|
+| `kmutil install --volume-root / --allow-missing-kdk` | 打印 `rebuild done`，但文件 mtime/大小不变，因为它认为已是最新 |
+| 加 `--update-all` | 会连 BootKC 一起重建，宿主机版本与目标卷不匹配时报 `com.apple.kpi.iokit not found` |
+| 用 `-L` 指定 kext 列表 | 会漏掉 `IOGraphicsFamily` 等隐式依赖，驱动仍拿不到 framebuffer |
+
+**顺带的结论**：系统更新（安全更新 / 小版本升级）都会重建 AuxKC，所以每次更新后都要跑一遍 `kmutil showloaded --list-only | grep nullmoth`，不够 4 行就按上面的命令重建。
+
+---
+
+## 12. 没有桌面时怎么进去：离线建账户 + 开 SSH
+
+装完系统之后，如果因为显卡驱动没起来而进不了桌面，会陷入死锁：**没有桌面 → 打不开「系统设置 → 通用 → 共享 → 远程登录」→ 没法 SSH → 没法修驱动**。
+
+这个死锁可以在**另一台 Mac 上离线破解**：直接往目标卷里写账户和 launchd 覆盖配置。
+
+### 12.1 先验证「用户覆盖能压过 plist 默认值」
+
+不要凭空猜。拿一个**已经能用 SSH 的系统**做对照：
+
+```bash
+# 系统自带的 sshd 服务定义写着 Disabled=true
+plutil -p /System/Library/LaunchDaemons/ssh.plist | grep -i disabled
+# → "Disabled" => true
+
+# 但用户覆盖里是 0（false）
+sudo plutil -p /var/db/com.apple.xpc.launchd/disabled.plist | grep sshd
+# → "com.openssh.sshd" => false
+
+# 而 SSH 实际是能用的
+```
+
+结论：**`/var/db/com.apple.xpc.launchd/disabled.plist` 里的用户覆盖优先于服务自身的 `Disabled` 键。** 往目标卷写同样的 `false`，ssh 就会起来。
+
+### 12.2 落地步骤（全部只写目标卷，不动源系统）
+
+记目标卷的 Data 分区挂载点为 `$T`（例如 `/Volumes/TAHOE - Data`）。
+
+**① 建用户**
+
+```bash
+$T/private/var/db/dslocal/nodes/Default/users/acer.plist
+```
+
+字段：`uid=501`、`gid=20`、`home=/Users/acer`、`shell=/bin/zsh`、`GeneratedUID` 用一个新的 UUID。
+
+密码这一步最省事的是**复用另一台机器上同一账户的 `ShadowHashData`**（933 字节，Base64）。但如果源账户带 Secure Token，必须把 `authentication_authority` 数组里的这几项剔掉，否则目标系统认证会异常：
+
+```
+;SecureToken;
+;Kerberosv5;;acer@LKDC:...
+HeimdalSRPKey
+KerberosKeys
+```
+
+**② 加进 admin 组**
+
+```
+$T/private/var/db/dslocal/nodes/Default/groups/admin.plist
+  users          = ['root', 'acer']
+  GroupMembership= ['root', 'acer']
+  GroupMembers   += <新用户 GeneratedUID>
+```
+
+**③ 放公钥**
+
+```bash
+$T/Users/acer/.ssh/authorized_keys     # 权限 600，属主 acer:staff
+```
+
+**④ 跳过设置助手**
+
+```bash
+touch $T/private/var/db/.AppleSetupDone
+touch $T/Users/acer/.skipbuddy
+```
+
+再写 15 个 `DidSee*` 键（`com.apple.SetupAssistant` 域）和 9 个 `Skip*` 的 managed plist。
+
+**⑤ 开 sshd**
+
+```bash
+$T/private/var/db/com.apple.xpc.launchd/disabled.plist
+  com.openssh.sshd = false
+```
+
+**⑥ 预生成 host key（容易漏，漏了会握手失败）**
+
+全新系统在第一次开 SSH 前没有任何 host key。离线补上：
+
+```bash
+ssh-keygen -q -t rsa     -b 3072 -N '' -f $T/private/etc/ssh/ssh_host_rsa_key
+ssh-keygen -q -t ecdsa   -b 256  -N '' -f $T/private/etc/ssh/ssh_host_ecdsa_key
+ssh-keygen -q -t ed25519         -N '' -f $T/private/etc/ssh/ssh_host_ed25519_key
+```
+
+**⑦ 验证（不启动目标系统就能验）**
+
+```bash
+dscl -f $T/private/var/db/dslocal/nodes/Default localhost -read /Local/Default/Users/acer
+# 能读出完整记录 = 目录服务能识别
+```
+
+### 12.3 三个坑
+
+- **不要**手工创建 `com.apple.access_ssh` 组。这个组**不存在**时表示「所有用户都可以 SSH」，建了反而要维护成员列表，写错就谁都进不去。
+- `ShadowHashData` 不能逐字段重编，必须整块照搬（933 字节）。自己拼 `SALTED-SHA512-PBKDF2` 基本进不去。
+- 那些 `DidSee*` / `Skip*` 少写几个只会让设置助手多弹几屏，**不会**导致 SSH 失败；但 `.AppleSetupDone` 漏了会卡在「创建账户」界面出不来。所以先保证 `.AppleSetupDone`，其余可选。
+
+---
+
+## 13. OpenCore 选单顺序没有排序逻辑
+
+**OpenCore 不会对启动项排序。** 显示顺序 = 扫描与注册的顺序：
+
+1. 固件 `BootOrder` 里已有的条目；
+2. APFS 扫描发现的 macOS 卷；
+3. `Misc/Entries` 里手工加的自定义条目 —— **永远排在最后**。
+
+让 macOS 排第一的可行组合：
+
+```
+Misc / Boot / HideAuxiliary   = true      # 隐藏 Recovery、Time Machine 等辅助项
+Misc / Security / ScanPolicy  = 19464963  # 收紧：去掉 ESP / NTFS 扫描位
+```
+
+`ScanPolicy = 19464963` 的副作用很实在：自动探测出来的 Windows 条目会消失，于是必须自己往 `Misc/Entries` 加一条 Windows，而且它一定排在 macOS 后面 —— 这刚好就是想要的顺序。
+
+> ⚠️ **做安装 U 盘时记得临时把 `ScanPolicy` 改回 `0`**，否则 U 盘根本不出现在选单里，找半天以为 U 盘没做好。
+
+**另一个独立的坑：F12 里两个「Ubuntu」死条目。** 两个 ESP 里都残留着 `EFI/ubuntu`（Kubuntu 的 shim + grub），但磁盘上 Linux 分区早已删除，`grub.cfg` 里 `search.fs_uuid 2514fd6e-...` 指向不存在的卷。选中只会掉进 `grub rescue>`。它跟 OpenCore 无关（`ScanPolicy` 关掉 ESP 扫描后 OC 选单里根本不显示），要清只能进 Windows：
+
+```cmd
+bcdedit /enum firmware
+bcdedit /delete {对应标识符}
+```
+
+只删 ESP 里的 `EFI/ubuntu` 目录**不会**清掉 NVRAM 里的引导项，F12 里照样在。
 
 ---
 
@@ -750,9 +1010,9 @@ networksetup -setairportpower en2 on     # 接口名用上面查到的实际值
 | `_OSI → XOSI` | 见 SSDT-XOSI 配套说明 | — | 配合 `SSDT-XOSI.aml`，让 ACPI 把系统识别成指定 Windows 版本 |
 | `UPCN` | `08 55 50 43 4E 12 07 04 00 0A FF 00 00` | `08 55 50 43 4E 12 07 04 <b>01</b> 0A FF 00 00` | XHC0/XHC1 端口标记可连接 |
 | `UPCC` | `08 55 50 43 43 12 07 04 00 0A FF 00 00` | `08 55 50 43 43 12 07 04 <b>01</b> 0A FF 00 00` | XHC2.PRT1 / 摄像头 UCAM |
-| ~~TPAD / OSYS~~ | `95 4f 53 59 53 0b dc 07` | `95 4f 53 59 53 0b 00 00` | ⚠️ **已证实非必需，不要加**。见 §3.3 |
+| `TPAD / OSYS` | `95 4f 53 59 53 0b dc 07` | `95 4f 53 59 53 0b 00 00` | **必需**。绕开 `TPAD._CRS` 里的 OSYS 门，让 `_CRS` 返回 `SBFB`+`SBFG`（I2C 总线地址 + GPIO 中断）。不加则 `ELAN050A` 建不出 nub，触控板完全无反应。见 §3.3 |
 
-AML opcode 速查：`08` NameOp · `12` PackageOp · `0A` BytePrefix · `95` If 里的 LNotEqual/比较上下文 · `0b` WordPrefix。做等长替换时，**Find 必须在 DSDT 里唯一**，否则会误伤其它表。
+AML opcode 速查：`08` NameOp · `12` PackageOp · `0A` BytePrefix · `0B` WordPrefix · `95` LNotEqual（比较类操作码）。做等长替换时，**Find 必须在 DSDT 里唯一**，否则会误伤其它表。改完务必用 `ioreg` 验证效果，不要只依赖反编译判断。
 
 ## 附录 B：日志规范化对比脚本
 

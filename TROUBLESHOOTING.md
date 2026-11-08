@@ -4,12 +4,13 @@
 
 ---
 
-## 0. 先记住四个结论
+## 0. 先记住五个结论
 
 1. **`EXITBS:START` 不是卡死点**。它是 OpenCore 能写的最后一行，成功和失败的日志都以它结尾。看到它不等于卡在这里，失败发生在 XNU 接管之后。
 2. **同一份 config 有时能进有时不能，先怀疑运行时随机量**（slide / 内存布局），不要急着回滚配置。
 3. **设备「突然坏了」时，先查是不是被自己关掉了**。本项目两次大弯路（USB、触控板）都源于排障做减法时关掉 kext 忘记加回。
 4. **「有画面 / 没画面」是一条独立于启动问题的排查线**。NullMoth 显卡 kext 装在系统卷 `/Library/Extensions`、由 AuxKC 加载，**不经过 `EFI/OC/Kexts`**，所以「改 config 做减法」根本影响不到它。黑屏或无 Metal 时按 §11 查，别去动 boot-args 里的 slide。
+5. **「屏幕冻在 -v、但 SSH 能进、WindowServer 还 running」是一个专属信号**：不是显示配置问题，是 AuxKC 里驱动路径畸形（跨版本重建时 `-p` 被剥掉了 `-R` 前缀）。见 §11.4。**这时候关任何 kext 都没用，只会把水搅浑。**
 
 ---
 
@@ -270,12 +271,14 @@ for sec in ['ACPI','Booter','DeviceProperties','Misc','PlatformInfo','UEFI']:
 - Recovery 也卡死、断电放电无效
 - 做减法到 9 个 kext → 成功进桌面
 - 逐项加回 → 网卡、触控板、WiFi 陆续恢复，但漏加了 USB kext
-- 加 TPAD 补丁后触控板可用 → 误以为找到了 ACPI 根因
+- 加 TPAD 补丁后触控板可用（**这一条后来被证明是对的**，见 README §3.3）→ 但当时误以为它也解释了启动挂死
 - 清掉 113 个旧日志 → OC 恢复写日志 → 拿到关键证据
 - 规范化 diff → 唯一变量是 `slide=`
 - 固定 slide + 原封不动加回蓝牙三件套 → **一次成功**
 
-最后回头看：**触控板补丁、XHCILagFix 有毒、SetupVirtualMap 是正解、装蓝牙必挂**这四条结论全是错的。真正的问题只有一个——**把运行时随机性当成了因果**。
+最后回头看：**「XHCILagFix 有毒」「SetupVirtualMap 是正解」「装蓝牙必挂」** 这三条结论全是错的。真正的问题只有一个——**把运行时随机性当成了因果**。
+
+> 触控板补丁需要单独澄清一下：这个补丁**是必需的**（不加以 `ELAN050A` 建不出 nub，见 README §3.3），当时错的不是「加补丁」，而是**「补丁也解释了启动挂死」这个推论**。补丁只管触控板，跟能不能进桌面毫无关系。
 
 > 所以这份手册最想留下的一句话是：
 > **先消除随机性，再谈因果；先用实测定义现象，再去找根因。**
@@ -308,6 +311,7 @@ nvram nullmoth-nv-ok                              # 1 = 安装器成功标记；
 | 画面闪烁 / 撕裂 | 零拷贝 scan-out 时序 | 先试 `-nvrmnoflip` |
 | 睡眠醒来后 GPU 丢失 | 电源树问题 | `-nvrmnopm`，并读官方 `docs/SLEEP-WAKE.md` |
 | 卡在 `PCI configuration end` | **首次启动正常现象** | 等最多约 1 分钟，不要断电 |
+| 屏幕冻在 `-v` 最后一行不动，但 SSH 能进、WindowServer 显示 `state = running` | **AuxKC 里 4 个驱动的路径是畸形的**，驱动一个都没装进去 | 立刻跳到 §11.4，别关 kext、别换 SMBIOS |
 
 ### 11.2 常见配置遗漏（逐项对照官方 README）
 
@@ -347,7 +351,50 @@ kmutil showloaded --list-only | grep nullmoth
 用 1401 安装的话，OC 启动菜单里那条 **「1401: Remove NVIDIA driver」** 是可逆入口；
 需要临时回到无驱动状态排查时选它，比手工删文件安全得多。
 
-### 11.4 与其他章节的边界
+### 11.4 跨版本重建 AuxKC：`-p` 会剥掉 `-R` 前缀（macOS 26 实测）
+
+在 macOS 15 里给 macOS 26 卷重建 AuxKC 时，如果目标卷名带空格（APFS Data 卷通常叫 `TAHOE - Data`），
+`kmutil create` 会把 `-p` 的路径**按 `-R` 前缀剥掉、剩下的当相对路径拼到当前工作目录**：
+
+```bash
+# 在 15 里执行，cwd 是 /Users/acer
+kmutil create -R "/Volumes/TAHOE" -p "/Volumes/TAHOE - Data/Library/Extensions/NVRMAGDC.kext" ...
+# 剥掉 /Volumes/TAHOE 后剩 " - Data/Library/Extensions/NVRMAGDC.kext"（相对路径）
+# 拼 cwd → /Users/acer/ - Data/Library/Extensions/NVRMAGDC.kext   ← 不存在
+```
+
+**怎么发现**：`kernelmanagerd` 日志里会明确写出来，注意路径中间那个突兀的 ` - Data/`：
+
+```
+Installation check: missing bundle for com.nullmoth.NVRMAGDC at /Users/acer/ - Data/Library/Extensions/NVRMAGDC.kext
+```
+
+四个驱动（`NVAccel` / `NVRM` / `NVRMAGDC` / `NVRMFB`）会全部被拒装。后果是内核、用户态、
+WindowServer 全都正常启动，只有屏幕永远不动 —— 因为拿不到 framebuffer。
+
+**正确做法**：到目标系统本机去跑，`cd /`，`-p` 全部用绝对路径：
+
+```bash
+cd /
+PB=$(ls -d /System/Volumes/Preboot/*/boot | head -1)
+sudo kmutil create -n aux -A /tmp/aux.kc -R / \
+  -p /Library/Extensions/NVAccel.kext  -p /Library/Extensions/NVRM.kext \
+  -p /Library/Extensions/NVRMAGDC.kext -p /Library/Extensions/NVRMFB.kext \
+  -k /System/Library/Kernels/kernel \
+  -B "$PB/System/Library/KernelCollections/BootKernelExtensions.kc" \
+  -S /System/Library/KernelCollections/SystemKernelExtensions.kc \
+  --build "$(sw_vers -buildVersion)" \
+  --allow-missing-kdk --no-authentication --no-authorization --force
+sudo cp /tmp/aux.kc /Library/KernelCollections/AuxiliaryKernelExtensions.kc
+sudo chown root:wheel /Library/KernelCollections/AuxiliaryKernelExtensions.kc
+sudo chmod 744 /Library/KernelCollections/AuxiliaryKernelExtensions.kc
+```
+
+三条走不通的路，别重复试：`kmutil install --volume-root`（打印 `rebuild done` 但文件不变）、
+`--update-all`（会连 BootKC 重建，版本不匹配报 `com.apple.kpi.iokit not found`）、
+`-L`（漏 `IOGraphicsFamily` 等隐式依赖）。
+
+### 11.5 与其他章节的边界
 
 - 如果 **连 OC picker 都看不到**：那是固件/启动项问题，回到 §1 决策树
 - 如果 **picker 能显示、但进系统后黑屏 / 无 Metal**：本节
