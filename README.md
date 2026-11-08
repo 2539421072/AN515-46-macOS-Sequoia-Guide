@@ -38,11 +38,11 @@
 
 | 功能 | 最终状态 | 关键手段 | 验证判据 |
 |---|---|---|---|
-| **显卡 / 内屏显示 + Metal 加速** | ✅ | **`nullmoth/nvidia-macos-driver` 2.7.2**（kext 装 `/Library/Extensions`，不从 EFI 注入）+ 一组 boot-args / SIP 设置 | `kmutil showloaded \| grep nullmoth` 有 4 行；`SPDisplaysDataType` 显示 `Metal Support: Metal 3` || WiFi（MT7922 / RZ616） | ✅ | `AirportMtkWlan.kext` v1.6.0（fork），`MinKernel=24.2.0` / `MaxKernel=24.99.99` | `system_profiler SPAirPortDataType` 显示 MT7922；实测 400–600 Mbps |
+| **显卡 / 内屏显示 + Metal 加速** | ✅ | **`nullmoth/nvidia-macos-driver` 2.7.2**（kext 装 `/Library/Extensions`，不从 EFI 注入）+ 一组 boot-args / SIP 设置 | `kmutil showloaded \| grep nullmoth` 有 4 行；`SPDisplaysDataType` 显示 `Metal Support: Metal 3` || WiFi（MT7922 / RZ616） | ✅ 15 / ❌ **26 无解** | 15 用 `AirportMtkWlan.kext` v1.6.0（fork），`MinKernel=24.2.0` / `MaxKernel=24.99.99`；26 的 `IO80211Family` 跳到 1200 版，ABI 不兼容，见 §3.1 | 15：`SPAirPortDataType` 显示 MT7922、实测 400–600 Mbps；26：`kmutil showloaded \| grep -i mtk` 为空 |
 | 蓝牙（同一张卡，USB `0489:e0e4`） | ✅ | `BlueToolFixup` + `SimpleMtkBtFw` + `SimpleMtkBtPatcher` + 2 个 NVRAM 变量 | `Chipset: THIRD_PARTY_DONGLE` / `State: On` / Address 非空 |
 | 触控板 + 多点手势 | ✅ | VoodooI2C 五件套 + `VoodooI2CHID` + **ACPI `TPAD._CRS` 的 OSYS 旁路补丁（必需，见 §3.3）** | `TPAD` 是 `VoodooI2CDeviceNub` 且 `Interrupt Mode = GPIO`；`VoodooI2CPrecisionTouchpadHIDEventDriver` active |
 | USB（不卡顿） | ✅ | 2 条 `UPCN`/`UPCC` ACPI 补丁 + `XHCILagFix.kext` | `Active=Yes`、`Failure=""`，鼠标 `busy` 数百 ms |
-| 声卡（ALC287） | ✅ | `AppleALC` + `alcid=13` | 扬声器 / 耳机 / 内置麦 / Line In 均可选 |
+| 声卡（ALC287） | ✅ | 15：`AppleALC` + `alcid=13`；**26：`AppleHDA` 已被删除，必须再加 `SimpleHDA.kext`（见 §3.5）** | `AppleHDAController@0,6` 出现且 `VendorProductID=283902599`(ALC287)；`SPAudioDataType` 有内建输出/输入 |
 | 有线网、键盘、电池、亮度键 | ✅ | `RealtekRTL8111` / VoodooPS2 / VirtualSMC 系列 / `BrightnessKeys` | 系统信息里可见 |
 | 冷启动随机失败 | ✅ 已规避 | boot-args 固定 `slide=<已验证值>` | 日志 `MBA:OUT` 中 slide 恒定，连续启动均成功 |
 | 摄像头出流 | ⚠️ 半通 | 枚举与供电正常，被 `XHCILagFix` 的 iso 缺陷阻塞 | 有设备节点但 0 帧 |
@@ -273,7 +273,7 @@ AMD (0x1002) 0x1681 → Kernel Extension Info: No Kext Loaded   ← 核显按预
 
 ---
 
-### 3.1 WiFi：MT7922 并非无解
+### 3.1 WiFi：MT7922 在 Sequoia 可用，在 Tahoe 上无解（2026-11-08 补充）
 
 **症状**：系统里完全没有 WiFi 接口；网上大量「MT7922 / RZ616 黑苹果无驱动，只能换卡」的说法。
 
@@ -299,6 +299,27 @@ networksetup -getairportnetwork en2
 system_profiler SPAirPortDataType | head -30
 # 期望：Firmware 显示 MT7922，协商 780 Mbps，实测 400–600 Mbps
 ```
+
+#### ⚠️ macOS 26 Tahoe：这个 kext 不能用了
+
+升级到 26 之后 WiFi 驱动完全不加载（`kmutil showloaded` 里查不到），容易误判成「配置写错了」。实测排查结论：
+
+| 检查项 | 结果 |
+|---|---|
+| `MaxKernel` 是 `24.99.99` | 正常，但 Darwin 25.6.0 不满足 → **被 OpenCore 跳过** |
+| 改成 `25.99.99` 硬放行 | 仍然不加载，说明问题不在版本门 |
+| 依赖 `corecapture`(1.0.4) / `IO80211Family`(1200.13.1) / `IOSkywalkFamily`(1.0) / `IONetworkingFamily`(3.4) | **全都在，版本都够** |
+| `IO80211Family` 版本号 | Sequoia 是 `1000.x`，Tahoe 是 **`1200.13.1`** —— 大版本跳变，私有 API/ABI 变了 |
+
+**结论：不是配置问题，是 ABI 不兼容。** `AirportMtkWlan` 是基于 itlwm 的 `AirportItlwm` 思路、直接使用 `IO80211Family` 私有类的，而 itlwm 上游对每个 macOS 大版本都要单独编译，正是因为这个 ABI 每版都变。原作者把 `MaxKernel` 卡在 `24.99.99` 是有意为之。作者仓库 `flxxxxddd/AirportMtkWlan` 目前已删除，没有 Tahoe 版本。
+
+**Tahoe 上的三条替代路线，我都评估过，全部不实用：**
+
+1. **原生 `AppleSunriseWLAN.dext`** —— Tahoe 首次内置了 MediaTek 驱动（DriverKit，路径 `/System/Library/DriverExtensions/`），匹配 `14c3:7922` / `0x7923` / `0x7932`，**不含我们这块的 `0x616`**。需要：SSDT 伪装 device-id + 从 KDK 提取 `AppleSunrise.kext`（HAL 层，系统里没有）+ 放 Linux 固件（`WIFI_MT7922_patch_mcu_1_1_hdr.bin`、`WIFI_RAM_CODE_MT7922_1.bin` 改名 `W7922_1.bin`）到 dext 目录 + 关 SIP 和 authenticated-root + 改系统卷后 `bless --create-snapshot`。社区到 2026 年 3 月的进度是：固件能加载、dext 能 attach、WiFi 图标不打叉，但 **`NIC Query V2` 返回 `0xfd`，扫不到任何 SSID，无法连接**。投入极大、结局是只有图标。
+2. **`laobamac/SimpleMtkWlan`** —— 只支持 `14c3:7961` / `0608` / `7922`，**不含 `0616`**，且作者标注 not release-stable、没有发布产物。
+3. **换卡** —— 换 Intel AX210 走 itlwm 也要面对同样的 Tahoe ABI 问题；换 Broadcom 则从 Sonoma 起就已失去原生支持。
+
+**所以这台机器在 macOS 26 上的现实是：用有线网（`RealtekRTL8111` 正常），WiFi 无解。** 如果 WiFi 是刚需，停留在 Sequoia 15 反而是更合理的选择。
 
 ### 3.2 蓝牙：一次「冤案」与最终解法 ★
 
@@ -472,11 +493,69 @@ ioreg -p IOService -w0 -r -c IOUSBHostDevice | grep "busy"
 
 ### 3.5 声卡
 
+#### Sequoia 15
+
 `AppleALC.kext` + boot-args `alcid=13`，对应 Realtek ALC287。扬声器、耳机、内置麦、Line In 均可用。换 layout 时记得清 NVRAM 或用 `alcid=` 覆盖，避免旧 layout 缓存。
 
 ```bash
 system_profiler SPAudioDataType | grep -iE "Output Source|Default Output|Transport"
 ```
+
+#### macOS 26 Tahoe：AppleHDA 被整个删掉了 ★
+
+升级到 26 后 `system_profiler SPAudioDataType` 的 `Devices:` 下面是空的，`AppleALC` 明明在 `kmutil showloaded` 里，却一点声音都没有。原因不是配置错了：
+
+```bash
+ls -d /System/Library/Extensions/AppleHDA.kext
+# → No such file or directory
+```
+
+**Apple 从 Tahoe beta 2 起直接删除了 `AppleHDA.kext`。** 理由是 Tahoe 仍然支持的四款 Intel Mac 全都带 T2 芯片，音频由 T2 处理，不需要 AppleHDA。而 `AppleALC` 的全部工作就是给 AppleHDA 打补丁 —— 宿主不在了，它自然什么也做不了。这是一个**结构性问题**，换 layout id、换 AppleALC 版本、改 `alc-verbs` 全都没用。
+
+**解法：`SimpleHDA.kext`**（`laobamac/SimpleHDA`，与本文用的 `SimpleMtkBt` 同一作者）。它是一个 Lilu 插件，通过 OpenCore 注入把原版 AppleHDA 补回来，让 AppleALC 继续用现有配置工作。**不改系统卷、不重建内核集合、不需要关 SIP。**
+
+前提条件（缺一不可）：
+
+```
+Lilu ≥ 1.7.1
+AppleALC 已启用 + 有效的 alcid 或 layout-id
+Kernel → Quirks → DisableLinkeditJettison = true   ← 最容易漏，必须为 true
+```
+
+加载顺序必须是 **`Lilu` → `AppleALC` → `SimpleHDA`**：
+
+```
+[7]  AppleALC.kext
+[8]  SimpleHDA.kext        ← 紧跟在 AppleALC 后面
+```
+
+条目本身：
+
+```
+BundlePath     = SimpleHDA.kext
+ExecutablePath = Contents/MacOS/SimpleHDA
+PlistPath      = Contents/Info.plist
+MinKernel      = 25.0.0
+MaxKernel      = 25.99.99
+Arch           = x86_64
+```
+
+不需要加 `keepsyms=1`（官方明确说过，符号表由 `DisableLinkeditJettison` 保留）。可选启动参数：`shda-lang=zh_CN`（指定设备名称语言，默认自动读 NVRAM，探测失败用简体中文）、`-shdaoff`（停用）。
+
+**验证（macOS 26.7.2 实测）**：
+
+```bash
+kmutil showloaded --list-only | grep -i simplehda        # 应有 1 行
+ioreg -r -c AppleHDAController -w0 | grep -E "Codec|VendorProductID"
+#   +-o AppleHDAController@0,6  ... active
+#       "CodecList" = ({"RevisionID"=1048578,"VendorProductID"=283902599})
+#       283902599 = 0x10EC0287 = ALC287  ← 认对了
+system_profiler SPAudioDataType | head -30
+#   内建麦克风 / 内建线路输入 / 内建输出（内置扬声器，2 通道）
+osascript -e "get volume settings"                        # output volume 可读可调
+```
+
+> **判据要点**：`AppleHDAController` 这个实例出现之前，一切努力都是白费 —— 没有它就没有 codec，没有 codec 就没有任何音频设备。看到 `VendorProductID=283902599` 就说明 codec 认出来了。
 
 ### 3.6 键盘 / 电池 / 亮度 / 有线网
 
@@ -636,6 +715,12 @@ kmutil showloaded --list-only | grep -iE 'BlueTool|SimpleMtkBt'
 # WiFi
 networksetup -listallhardwareports | grep -A2 -i Wi-Fi
 system_profiler SPAirPortDataType | grep -E 'Card Type|Firmware Version|Status:'
+kmutil showloaded --list-only | grep -iE "airportmtk|itlwm"     # 空 = 驱动没加载（26 上正常）
+
+# 声卡（26 上必须查两层：有没有控制器，有没有设备）
+kmutil showloaded --list-only | grep -iE "applealc|simplehda"   # 15 上 1 行，26 上 2 行
+ioreg -r -c AppleHDAController -w0 | grep -E "Codec|VendorProductID"
+system_profiler SPAudioDataType | head -30
 
 # 触控板（两层都要查，缺一不可）
 ioreg -p IOService -n TPAD -r -d 3 | grep -E "VoodooI2CDeviceNub|Interrupt Mode|gpioPin"
