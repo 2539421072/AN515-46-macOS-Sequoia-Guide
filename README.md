@@ -42,11 +42,12 @@
 | **WiFi（MT7922 / RZ616）** | ✅ 15 / ✅ **26（2026-11-08 跑通）** | 15：`AirportMtkWlan` v1.6.0；**26：`eiyuumiru/SimpleMtkWlan` 的 `AirportMtkWlan` v0.3.0-beta（Tahoe build）**，`MaxKernel` 必须写成 `25.99.99`，详见 §3.1 | 26：`kmutil showloaded \| grep -i airport` 有 1 行、`en2` 拿到 IP、`ping 外网` 0% 丢包 |
 | 蓝牙（同一张卡，USB `0489:e0e4`） | ✅ | `BlueToolFixup` + `SimpleMtkBtFw` + `SimpleMtkBtPatcher` + 2 个 NVRAM 变量 | `Chipset: THIRD_PARTY_DONGLE` / `State: On` / Address 非空 |
 | 触控板 + 多点手势 | ✅ | VoodooI2C 五件套 + `VoodooI2CHID` + **ACPI `TPAD._CRS` 的 OSYS 旁路补丁（必需，见 §3.3）** | `TPAD` 是 `VoodooI2CDeviceNub` 且 `Interrupt Mode = GPIO`；`VoodooI2CPrecisionTouchpadHIDEventDriver` active |
-| USB（不卡顿） | ✅ | 2 条 `UPCN`/`UPCC` ACPI 补丁 + `XHCILagFix.kext` | `Active=Yes`、`Failure=""`，鼠标 `busy` 数百 ms |
+| USB（不卡顿，且不破坏摄像头） | ✅ | 2 条 `UPCN`/`UPCC` ACPI 补丁 + **`XhciNudge.kext`（`XHCILagFix` 已弃用，它会把 UVC 摄像头一起废掉，见 §3.4）** | `kmutil showloaded` 有 `local.XhciNudge`；鼠标不瞬移、U 盘正常；**摄像头同时能出图** |
 | 声卡（ALC287） | ✅ | 15：`AppleALC` + `alcid=13`；**26：`AppleHDA` 已被删除，必须再加 `SimpleHDA.kext`（见 §3.5）** | `AppleHDAController@0,6` 出现且 `VendorProductID=283902599`(ALC287)；`SPAudioDataType` 有内建输出/输入 |
 | 有线网、键盘、电池、亮度键 | ✅ | `RealtekRTL8111` / VoodooPS2 / VirtualSMC 系列 / `BrightnessKeys` | 系统信息里可见 |
 | 冷启动随机失败 | ✅ 已规避 | boot-args 固定 `slide=<已验证值>` | 日志 `MBA:OUT` 中 slide 恒定，连续启动均成功 |
-| 摄像头出流 | ⚠️ 半通 | 枚举与供电正常，被 `XHCILagFix` 的 iso 缺陷阻塞 | 有设备节点但 0 帧 |
+| 摄像头出流 | ✅ **可用**（2026-11-19 修正） | 换掉 `XHCILagFix` 后 iso 传输不再被破坏；`system_profiler` 认出 `ACER HD User Facing` | FaceTime、第三方 App 均能出图；**判据必须用第二个 App 交叉验证**，见 §3.7 |
+| 第三方 App 的摄像头 / 麦克风权限 | ⚠️ 需手工授权 | boot-args 关掉 AMFI 后 `tccd` 判定「不弹窗」，须直接写 TCC 数据库（`tccgrant`），见 §3.9 | 写完库后 **⌘Q 完全退出 App 再打开**，`log` 里出现 `Allowed (User Consent)` |
 | Type-C 视频输出 | ❌ 无解 | BIOS 的 Discrete GPU only 物理切断 DP Alt Mode | 只有内屏 + HDMI 两个 connector |
 | 右侧第 4 个 USB-A 的 USB 2.0 通道 | ✅ **26 上自己好了**（15 上不行） | 无需补丁：Tahoe 的 USB 栈自己认了这个通道（15 上它在 ACPI 端口表里没定义），详见 §3.4 末 | 有线鼠标插上直接出节点、可用 |
 
@@ -557,7 +558,7 @@ kmutil showloaded --list-only | grep -iE "voodooi2c|voodooinput|voodoogpio"
 
 > 顺带一条纪律：`AppleMultitouchDevice` 注册成功**不能**当成触控板可用的证据。`VoodooInput` 只要加载就会注册那个模拟设备，哪怕一条真实数据都收不到。
 
-### 3.4 USB：两条 ACPI 补丁 + XHCILagFix
+### 3.4 USB：两条 ACPI 补丁 + XhciNudge（`XHCILagFix` 已弃用）
 
 本机有 5 个 XHCI 控制器，症状分两类，别混为一谈。
 
@@ -584,11 +585,11 @@ Replace : 08 55 50 43 43 12 07 04 01 0A FF 00 00
 
 字节解读：`08` = NameOp，`55 50 43 4E` = "UPCN"，`12 07 04` = Package(4)，`00`/`01` = 首元素，`0A FF` = Byte 255。
 
-#### (b) 设备能用但极度卡顿 → XHCILagFix
+#### (b) 设备能用但极度卡顿 → `XHCILagFix`（旧方案，已弃用）
 
 **症状（与 (a) 完全不同）**：鼠标插上能识别，但**移动一下要 3–4 秒光标才动、且是瞬移**；U 盘能识别却读不出数据。这是 AMD 平台 XHCI 完成事件通知路径约 50 ms 延迟的典型表现。
 
-**做法**：`XHCILagFix.kext`（Lilu 插件，实验性项目）把 Control/Bulk/Interrupt 传输的完成事件从 Interrupter 1 重定向回 Interrupter 0 / Ring 0。
+**旧做法**：`XHCILagFix.kext`（Lilu 插件，实验性项目）把 Control/Bulk/Interrupt 传输的完成事件从 Interrupter 1 重定向回 Interrupter 0 / Ring 0。
 
 ```
 BundlePath     = XHCILagFix.kext
@@ -597,20 +598,48 @@ PlistPath      = Contents/Info.plist
 Arch           = x86_64
 ```
 
-安装前提：放在 `Lilu` 之后；`Lilu >= 1.7.3`；没有 `GenericUSBXHCI` 等重复改写 USB 栈的旧插件。它支持用 `-xhcilagfixoff` 启动参数临时禁用，方便对比测试而不用反复改 config。
+**代价（这是它被淘汰的原因，务必看）**：它把**等时（iso）传输**也一起重定向了，而 iso 完成必须走 `AppleUSBXHCI::filterOccurred → isochronousFilterInterrupt()`。落到 Ring 0 的 iso **永不完成**，于是 **UVC 摄像头有供电、能枚举、就是拿不到帧**。
 
-**验证**：
+> 📌 **曾经的误判**：本文旧版把「摄像头 0 帧」写成本机摄像头的固有缺陷。真相是它由 `XHCILagFix` 造成 —— 换掉这个 kext 后摄像头直接能出图，见 §3.7。
+>
+> 现在这条 kext 在 `Kernel → Add` 里**保留文件但置 `Enabled=false`**，随时可翻回对比。项目自述为 **experimental**，作者只在 Ryzen 9 8945HS / ROG Zephyrus G14 上验证过；本机 6800H 属同一机理但不在官方验证范围内，实测可用。
+
+#### (c) 现用方案：`XhciNudge`（USB 不卡 + 摄像头可用，两个一起要）
+
+`XhciNudge` 换了思路：**不去改写 `AppleUSBXHCI` 的中断路由**，而是每 N 毫秒用每个控制器**自己的 MSI 向量**发一次 IPI，触发 Apple 已经注册好的 handler 去收积压的完成事件。它只读 PCI config 空间和 `USBSTS`，**从不写控制器寄存器**，因此完全不碰 iso 传输。
+
+| | `XHCILagFix`（旧，已弃用） | **`XhciNudge`（现用）** |
+|---|---|---|
+| 原理 | Lilu 插件 patch `AppleUSBXHCI`，完成事件从 Interrupter 1 → 0 | 用控制器自己的 MSI 向量发 IPI，触发已注册 handler 收积压事件 |
+| 对 iso 传输 | **破坏**（UVC 摄像头废） | **不动**（只读 PCI config + USBSTS） |
+| 加载方式 | 依赖 Lilu hook，有启动竞态 | 匹配 `IOResources`，早期加载 |
+| 配置 | `Kernel:Add` 里 `Enabled=False`，文件保留 | `Kernel:Add` 索引 **1**（紧跟 Lilu），`Arch=x86_64` |
+
+**源码**：https://github.com/MonkaKokosowa/XhciNudge
+作者那台 Lenovo LOQ 15ARP9 的 XHCI 控制器是 `1022:161D/161E`，**与本机 `pci1022,161d` / `pci1022,161e` 完全同款**，所以适配性有保障。
+
+**编译**（本机，不需要装 Xcode）：
 
 ```bash
-ioreg -r -c XHCILagFix -l -w0 | grep -E '"Active"|"Failure"|"Mode"'
-ioreg -p IOService -w0 -r -c IOUSBHostDevice | grep "busy"
-# Active=Yes / Failure 为空 = 三个 Hook 装上了
-# 鼠标节点 busy 从 7949 ms 降到 320 ms 左右 = 延迟问题已解决
+cd XhciNudge-main
+make SDK=<MacKernelSDK 路径> LD64=/usr/bin/ld OUT=build
+# 产物约 30 KB；检查 nm -u 不能出现 __cxa_atexit
 ```
 
-**代价（重要）**：它把**等时（iso）传输**也重定向了，而 iso 完成必须走 `AppleUSBXHCI::filterOccurred → isochronousFilterInterrupt()`。落到 Ring 0 的 iso 永不完成，于是**摄像头有供电、有枚举、就是拿不到帧**。这是一个二选一：要 USB 不卡顿，就得接受摄像头不出流（上游 issue #3 有未合并的修法）。
+**boot-arg**：`xhcinudge=<ms>`，默认 4，作者自己用 1。**本机现为 `xhcinudge=1`**（这个值同时解决了 iso 传输的问题）。
 
-> ⚠️ 项目自述为 **experimental**，作者只在 Ryzen 9 8945HS / ROG Zephyrus G14 上验证过。本机 6800H 属于同一机理但不在官方验证范围内，实测可用。
+**验证**（本机 2026-11-19 实测输出）：
+
+```bash
+kmutil showloaded --list-only | grep -iE "xhcinudge|appleusbxhci"
+#    56    0 ... local.XhciNudge (1.0.0)
+#    87    1 ... com.apple.driver.usb.AppleUSBXHCI (1.2)
+#    88    0 ... com.apple.driver.usb.AppleUSBXHCIPCI (1.2)
+
+ioreg -r -c XhciNudge -l -w0 | grep -E "registered|active"   # registered, matched, active
+```
+
+判定标准是**两件事同时成立**：鼠标移动不再瞬移/U 盘能读，**并且**摄像头能出图（§3.7）。只满足前者说明你还在用 `XHCILagFix`。
 
 **右侧第 4 个 USB-A 的 USB 2.0 通道：Sequoia 15 上不行，macOS 26 Tahoe 上自己好了。**
 
@@ -699,9 +728,32 @@ osascript -e "get volume settings"                        # output volume 可读
 
 > **教训**：排障时做减法关掉 kext 之后，必须列清单逐项加回。本项目里「USB 突然不能用」「触控板突然不能用」两次假故障，都是关掉后忘记加回造成的，白白绕了一大圈。
 
-### 3.7 摄像头（半通）
+### 3.7 摄像头：可用（2026-11-19 结论修正）
 
-设备 `ACER HD User Facing` 能枚举、能供电，但 0 帧。当前根因指向 `XHCILagFix` 的 iso 缺陷（见 3.4）。临时关掉 `XHCILagFix` 可以验证这个判断，但会让 USB 卡顿回归，验证完请立刻加回。
+设备 `ACER HD User Facing`（UVC，`VendorID_1032 / ProductID_16437`），走 `AppleUSBVideoSupport` / `UVCAssistant`，**MJPEG 解码与 iso 传输全部正常**。
+
+```bash
+system_profiler SPCameraDataType
+#   ACER HD User Facing
+#     Model ID: UVC Camera VendorID_1032 ProductID_16437
+```
+
+**曾经错在哪里**：早期根据 `UVCAssistant` 日志「流启动 6 秒后被 stop」判断「iso 没数据进来」。**这个推断是错的** —— 当时机器上装的是 `XHCILagFix`，它把 iso 完成事件一起重定向到 Ring 0，iso 永不完成，摄像头当然 0 帧。换成 `XhciNudge`（§3.4 (c)）后，同一台机器、同一个摄像头直接出图。
+
+**判断纪律（重要）**：判断摄像头是否出图，**必须用第二个 App 交叉验证**，不能只看 `UVCAssistant` 日志的时间线。可用的验证目标：FaceTime、任何 UVC 摄像头 App，或浏览器网页调 `getUserMedia`。
+
+```bash
+# 能列出设备并成功开流，就说明驱动链路正常
+system_profiler SPCameraDataType
+/usr/bin/log show --last 2m --info --predicate 'process == "UVCAssistant"' 2>/dev/null | tail -20
+```
+
+> 注意：本机 `logd` 的时间戳与系统时钟有偏移，`--last/--start` 可能取到错误区间；要精确核对时先导出成文件再 grep（见 §3.9）。
+
+**摄像头本身没问题，但上层还有两个独立问题**，别混在一起查：
+
+1. **第三方 App 拿不到权限**（提示「请到系统设置里授权」，但列表里没有条目）→ 见 **§3.9**，这是 TCC 数据库问题，与摄像头驱动无关。
+2. **Photo Booth 主窗口预览全黑**（但菜单栏小窗正常、拍照也正常）→ 见 **§3.10**，是 NullMoth 驱动的上游 bug。
 
 ### 3.8 Type-C 视频输出（无解）
 
@@ -710,6 +762,112 @@ Acer 官方说明：**启用 BIOS 的「Discrete GPU only」时，Type-C 不支�
 三条佐证：内屏挂在 RTX 3060 上（当前就是 Discrete 模式）；日志恒定 `connected display(s) of 2 handle(s)`，connector 只有内屏 `0x2` 和 HDMI `0x1`；Type-C 屏在跑码阶段（UEFI 帧缓冲）能显示，一进桌面就冻结在最后一帧。
 
 理论上切 BIOS 到 Optimus 模式并启用 `RembrandtGfx.kext` 可能恢复，但作者自述该 kext「还没优化好」，切模式后内屏改走核显很可能直接黑屏且无法进系统改回，**风险远大于收益，不建议尝试**。实用替代是 DisplayLink USB 显卡扩展坞。
+
+### 3.9 第三方 App 拿不到摄像头 / 麦克风权限（TCC）★
+
+**现象**：腾讯会议、微信等 App 每次调用摄像头都弹自己的提示「请到系统设置里授权」，但 `系统设置 → 隐私与安全性 → 摄像头` 列表里**根本没有这个 App，也没有 `+` 按钮**；`sudo tccutil reset Camera` 重置后依旧。
+
+> 先澄清一个常见误解：设置里那个列表只显示**已经成功请求过**权限的 App，系统不允许手工添加。所以「列表里没有」是结果，不是原因。
+
+**根因：boot-args 把 AMFI 关掉了**
+
+`amfi_get_out_of_my_way=0x1 amfi=0x80`（本机为加载未签名的显卡驱动而加）会让 `tccd` 无法验证客户端代码签名，于是它**主动决定「不弹窗」**，并把请求直接判为拒绝：
+
+```
+tccd: CS_PLATFORM_BINARY set but not AppleSigned; prompt policy is Deny.
+tccd: Policy disallows prompt for Sub:{com.tencent.meeting} ... access to kTCCServiceCamera denied
+tccd: AUTHREQ_RESULT: msgID=1029.6, authValue=0, authReason=5
+```
+
+抓日志的方式（`amfi` 关掉后 `log` 在 zsh 里可能是 alias，必须用绝对路径）：
+
+```bash
+/usr/bin/log show --last 40m --predicate 'process == "tccd"' --info --style compact > /tmp/tccd.txt
+grep "Policy disallows prompt" /tmp/tccd.txt | grep -oE 'identifier=[a-zA-Z0-9._-]+' | sort | uniq -c
+# 受影响的不只是第三方 App：com.apple.UserEventAgent、com.apple.routined 同样被拒
+```
+
+**两个必须知道的细节**：
+
+- 这不是全局瘫痪。同一台机器上 Edge 能正常弹窗并落库（`auth_reason=2`），所以**别看到几百条报错就断言「TCC 全坏了」**。
+- **`tccd` 在进程启动时读授权**。写完数据库不重启 App，等于没写 —— 它还在用进程启动时那份结果。这是本项目最容易白干半天的一步。
+
+**解法：直接写用户库的授权记录**
+
+```bash
+D="$HOME/Library/Application Support/com.apple.TCC"
+cp "$D/TCC.db" "$D/TCC.db.bak-$(date +%Y%m%d-%H%M%S)"     # 先备份
+
+# csreq 是 BLOB，用 SQLite 的 X'...' 十六进制字面量写入（生成方法见下）
+sqlite3 "$D/TCC.db" "INSERT OR REPLACE INTO access
+ (service,client,client_type,auth_value,auth_reason,auth_version,csreq,policy_id,
+  indirect_object_identifier_type,indirect_object_identifier,flags,last_modified,boot_uuid,last_reminded)
+ VALUES ('kTCCServiceCamera','com.tencent.meeting',0,2,1,1,X'<hex>',
+         NULL,0,'UNUSED',0,strftime('%s','now'),'UNUSED',strftime('%s','now'));"
+```
+
+字段含义：`auth_value=2` 允许、`auth_reason=1` 用户授权；`csreq` 是 designated requirement，能算就算（与系统自己写的记录同构，更稳）。
+
+```bash
+# 注意：codesign 的 requirement 输出到 stdout，不是 stderr（重定向到文件会得到空文件）
+codesign -d -r- /Applications/TencentMeeting.app 2>/dev/null | sed 's/^designated => //' > /tmp/req.txt
+csreq -r "$(cat /tmp/req.txt)" -b /tmp/req.csreq
+xxd -p /tmp/req.csreq | tr -d '\n'      # 转成十六进制填进上面的 <csreq 二进制> 处
+```
+
+**成品工具**：把上面这套封装成了 `tccgrant`（本机 `/usr/local/bin/tccgrant`，源码见本项目仓库根目录的 `tccgrant.sh`）。
+
+```bash
+sudo tccgrant list                                       # 看现有授权
+sudo tccgrant camera,microphone com.tencent.meeting      # 按 bundle id 授权
+sudo tccgrant camera /Applications/QQ.app                # 也接受路径
+sudo tccgrant camera com.xxx --revoke                    # 撤销
+```
+
+> **纪律**：授权后必须 **⌘Q 完全退出该 App 再打开**。验证标准是日志里出现 `Auth Right: Allowed (User Consent)`，而不是 App 不再弹提示。
+
+**治本方案已验证失败（2026-11-19，macOS 26.7.2 + NullMoth 3.0）**
+
+社区通行做法是「用 `AMFIPass.kext` + `-amfipassbeta` 替代两个 `amfi` 参数」，但本机实测**不可行**：
+
+- 改完重启后，`AMFIPass 1.4.1` 和 4 个 `NVRM*` kext 全部正常加载
+- 但 `WindowServer` 每 10 秒崩溃一次 → 黑屏，崩溃栈固定在
+  `CoreDisplay_CreateDisplayForCGXDisplayDevice → __assert_rtn → abort trap: 6`
+- 原因：AMFIPass 只放行 **kext**，而 `/Library/GPUBundles/NVMTLDriver.bundle` 是 `flags=0x2(adhoc)`、无 TeamID 的**用户态 bundle**；原来 `amfi=0x80` 顺带把库验证也关了，WindowServer 才能把它加载进来。换成 AMFIPass 后这条豁免没了
+- 完全断电冷启动无法绕过，说明是机制冲突，不是残留状态
+
+**回滚必读**：恢复 config 前后都要检查显卡启动计数，它到 2 会永久自禁用驱动：
+
+```bash
+nvram 7C436110-AB2A-4BBB-A880-FE41995C9F82:nullmoth-nv-starts    # 改之前先看
+sudo nvram -d 7C436110-AB2A-4BBB-A880-FE41995C9F82:nullmoth-nv-starts
+```
+
+结论：**保留 `amfi=0x80` + 用 `tccgrant` 逐个 App 授权**，是当前唯一稳定组合。代价只是每装一个新 App 跑一条命令。
+
+### 3.10 Photo Booth 主窗口预览黑屏（上游 bug，非本机问题）
+
+**症状**：Photo Booth 主窗口预览区全黑，但**菜单栏小窗有画面、拍照也能存出正常照片**。
+
+这说明相机采集、iso 传输、解码都正常，坏的只是「把帧渲染进主窗口那一层纹理」。
+
+```bash
+/usr/bin/log show --last 5m --info --style compact --predicate 'process == "Photo Booth"' \
+  | grep -iE "CIRenderDestination|destination is nil"
+# -[CIRenderDestination initWithMTLTexture:commandBuffer:] texture usage must include MTLTextureUsageShaderWrite.
+# -[CIContext(CIRenderDestination) _startTaskToRender:toDestination:...:] The destination is nil.
+```
+
+**根因**：NullMoth 驱动给 `CAMetalLayer` 的 drawable 纹理没有带上 `MTLTextureUsageShaderWrite`，CoreImage 拒绝渲染到该目标，预览层目标被置空。属驱动侧缺口，用户侧无配置可绕（已枚举驱动里 244 个 `NVMTL_*` 开关，无一控制 drawable 的 texture usage）。
+
+**上游状态**（截至 2026-11-19，驱动 3.0）：
+
+| issue | 内容 | 状态 |
+|---|---|---|
+| [#568](https://github.com/nullmoth/nvidia-macos-driver/issues/568) | 相机预览黑；4:2:2 纹理默认未开 | 3.0 已修一半（`NVMTL_YUV422` 默认开） |
+| [#585](https://github.com/nullmoth/nvidia-macos-driver/issues/585) | 3.0 上预览仍黑，`ShaderWrite` 缺失 | **open** |
+
+**处置**：等驱动更新（作者修得很快，#568 从报告到发布只隔几小时）。不打算为此改系统 —— 已确认与 TCC 权限、USB 驱动都无关。临时替代：FaceTime、浏览器 `getUserMedia`、第三方相机 App 均正常。
 
 ---
 
@@ -792,7 +950,7 @@ Dortania / OpenCore 配置文档原文：
  2  SimpleMtkBtFw.kext          1.1.0          ├ 蓝牙（本次修复）
  3  SimpleMtkBtPatcher.kext     1.1.0          ┘
  4  AirportMtkWlan.kext         15: Min=24.2.0 Max=24.99.99 ｜ 26: Min=25.0.0 Max=25.99.99   ← WiFi（26 用 v0.3.0-beta Tahoe build，见 §3.1）
- 5  XHCILagFix.kext                           ← USB 不卡顿
+ 5  XhciNudge.kext                            ← USB 不卡顿 + 摄像头能出图（须紧跟 Lilu；旧的 XHCILagFix 条目保留但 Enabled=false）
  6  AMFIPass.kext               Min=20.0.0
  7  AppleALC.kext                             ← alcid=13
  8  AppleMCEReporterDisabler.kext
@@ -815,7 +973,7 @@ Dortania / OpenCore 配置文档原文：
 25  WhateverGreen.kext
 ```
 
-**关闭的条目**（历史遗留，不要动）：`USBToolBox.kext`、`UTBDefault.kext`、`VoodooPS2/PlugIns/VoodooInput.kext`、`USBMap.kext`（文件不存在）、`RTCMemoryFixup.kext`、`RembrandtGfx.kext`（未加入列表）。
+**关闭的条目**（历史遗留，不要动）：`XHCILagFix.kext`（被 `XhciNudge` 取代，它会废掉 UVC 摄像头，见 §3.4）、`USBToolBox.kext`、`UTBDefault.kext`、`VoodooPS2/PlugIns/VoodooInput.kext`、`USBMap.kext`（文件不存在）、`RTCMemoryFixup.kext`、`RembrandtGfx.kext`（未加入列表）。
 
 > **macOS 26 的差异**：`Kernel/Add` 实际 **32 条**（多了 `SimpleHDA.kext`，紧跟 `AppleALC` 之后——26 删掉了 `AppleHDA.kext`，见 §3.5），
 > 且第 4 条必须是 `eiyuumiru` 的 v0.3.0-beta **Tahoe build**（`Min=25.0.0` / `Max=25.99.99`）。
@@ -863,10 +1021,15 @@ ioreg -p IOService -n TPAD -r -d 3 | grep -E "VoodooI2CDeviceNub|Interrupt Mode|
 ioreg -c IOHIDDevice -r -w0 | grep -i "magic trackpad"
 kmutil showloaded --list-only | grep -iE "voodooi2c|voodooinput|voodoogpio"   # 期望 5 行
 
-# USB（唯一判据，别用别的指标替）
-ioreg -r -c XHCILagFix -l -w0 | grep -E '"Active"|"Failure"'
-#   正常：Active = Yes 且 Failure = ""
-#   异常：Active = No / Failure = "waiting for AppleUSBXHCI"  → 补丁没装上
+# USB（两条判据都要过：不卡顿 + 摄像头能出图）
+kmutil showloaded --list-only | grep -iE "xhcinudge|appleusbxhci"
+#   正常：local.XhciNudge (1.0.0) 在 ~56；AppleUSBXHCI / AppleUSBXHCIPCI 各一行
+ioreg -r -c XhciNudge -l -w0 | grep -E "registered|active"
+#   正常：registered, matched, active
+nvram boot-args | grep -oE "xhcinudge=[0-9]+"     # 本机为 xhcinudge=1
+
+# 摄像头（必须用第二个 App 交叉验证，见 §3.7）
+system_profiler SPCameraDataType | grep -A2 "ACER HD User Facing"
 
 # 启动参数
 nvram boot-args
@@ -913,7 +1076,9 @@ networksetup -setairportpower en2 on     # 接口名用上面查到的实际值
 - [ ] **显卡驱动与系统更新**：macOS 安全更新会重建 AuxKC，更新后需确认 `kmutil ... | grep nullmoth` 仍是 4 行，失效则重跑 1401/install.sh
 - [ ] **睡眠唤醒后的 GPU**：若睡醒丢显卡，试 `-nvrmnopm`；参考官方 `docs/SLEEP-WAKE.md`
 - [ ] **HDMI 外接显示器**：本机只枚举出 2 个 connector（内屏 + HDMI），多屏 / 热插拔行为未系统验证
-- [ ] **摄像头出流**：等 `XHCILagFix` 上游修 iso 重定向（issue #3），或临时关闭它做取舍验证
+- [x] ~~**摄像头出流**~~：**已解决（2026-11-19）**。根因是 `XHCILagFix` 破坏 iso 传输，换成 `XhciNudge` 后摄像头正常，见 §3.4 (c) 与 §3.7
+- [ ] **第三方 App 的摄像头/麦克风权限**：`amfi=0x80` 下 `tccd` 不弹窗，需用 `tccgrant` 逐 App 写库；治本方案（AMFIPass）已验证失败，见 §3.9
+- [ ] **Photo Booth 主窗口预览黑**：上游驱动 bug（NullMoth #585），等版本更新，见 §3.10
 - [ ] **Type-C 视频输出**：物理切断，实用解法是 DisplayLink 扩展坞
 - [x] ~~**右侧 USB-A 的 USB 2.0 通道**~~：**macOS 26 上已自动可用**，无需补丁（15 上缺 ACPI 端口描述，见 §3.4 末）
 - [ ] **WiFi 睡眠唤醒**：`AirportMtkWlan` 目前不支持 sleep/wake，睡醒要重启 → 26 上建议直接关掉睡眠
@@ -987,7 +1152,8 @@ networksetup -setairportpower en2 on     # 接口名用上面查到的实际值
 
 | 项目 / 资料 | 链接 | 结论 |
 |---|---|---|
-| **hbyonly1/XHCILagFix** | https://github.com/hbyonly1/XHCILagFix | ★ **采用**：实验性 AppleXHCI 完成事件重定向，`OpenCore/Kernel-Add.plist` 里有官方注入条目可对照 |
+| **MonkaKokosowa/XhciNudge** | https://github.com/MonkaKokosowa/XhciNudge | ★ **采用**：用控制器自己的 MSI 向量发 IPI 收积压完成事件，**不碰 iso 传输** → USB 不卡 + 摄像头可用（§3.4 (c)） |
+| **hbyonly1/XHCILagFix** | https://github.com/hbyonly1/XHCILagFix | **已弃用**（条目保留 `Enabled=false`）：实验性完成事件重定向，但把 iso 一起重定向，UVC 摄像头永远 0 帧 |
 | └ issue #3 | https://github.com/hbyonly1/XHCILagFix/issues/3 | iso 传输永不完成 = 摄像头 0 帧的根因，作者给了未合并的修法 |
 | AMD-OSX 论坛线索 | 帖名 `amd-rayon-r7-6800h-install-ventura-kernel-panic`（用户 `redhorse1990`） | 最初发现 XHCILagFix 的渠道；**未保存完整 URL，此处不提供猜测地址** |
 
@@ -1017,10 +1183,10 @@ networksetup -setairportpower en2 on     # 接口名用上面查到的实际值
 
 | 强度 | 内容 |
 |---|---|
-| **实测（本机）** | NullMoth 2.7.2 的 4 个 kext + Metal 3 / 165Hz 内屏；蓝牙三件套 + NVRAM 变量 + 固定 slide；XHCILagFix 的 `Active=Yes` 与 busy 时间；UPCN/UPCC 补丁；`alcid=13`；VoodooI2C 五件套 + `TPAD._CRS` OSYS 旁路补丁（`Interrupt Mode = GPIO`）；macOS 26 上 `MacPro7,1` 全功能复现 |
+| **实测（本机）** | NullMoth 2.7.2 的 4 个 kext + Metal 3 / 165Hz 内屏；蓝牙三件套 + NVRAM 变量 + 固定 slide；**`local.XhciNudge` 1.0.0 加载 + `xhcinudge=1`，摄像头（ACER HD User Facing）能出图**；UPCN/UPCC 补丁；`alcid=13`；VoodooI2C 五件套 + `TPAD._CRS` OSYS 旁路补丁（`Interrupt Mode = GPIO`）；**直写 TCC.db 后腾讯会议/微信摄像头与麦克风均放行**（`Allowed (User Consent)`）；macOS 26 上 `MacPro7,1` 全功能复现 |
 | **官方/上游文档** | NullMoth 官方 README 的 boot-args / SIP / Kernel-Block / `gfxrst=4` 要求；`slide=value` 使 `ProvideCustomSlide` 失效；`MmioWhitelist` 需 `DevirtualiseMmio=True`；AirportMtkWlan 的 Min/MaxKernel 要求 |
 | **他人实测案例** | MT7921K/RZ608 在 macOS 15 + iMacPro1,1 完整工作；MT7922 `0489:E0D8` 在 Tahoe 26 能连 BLE；同款 6800H 的机型 AirPods 可连 |
-| **推测 / 未验证** | 摄像头根因指向 XHCILagFix iso 缺陷（未做关 kext 对比）；Type-C 切 Optimus 方案；`DevirtualiseMmio=True` 的效果 |
+| **推测 / 未验证** | Photo Booth 主窗黑的修复版本（等 NullMoth 上游 #585）；Type-C 切 Optimus 方案；`DevirtualiseMmio=True` 的效果 |
 
 ---
 

@@ -146,6 +146,10 @@ OpenCore 官方配置文档：
 | 改回原 config 还是起不来 | 「config 被写坏了 / 文件缺了」 | 先做逐文件 MD5 对比；若一致，就是运行时变量 |
 | reset NVRAM 后偶尔能进 | 「NVRAM 残留是根因」 | 只是又抽了一次签，恰好抽到可用值 |
 | 触控板/USB 突然不可用 | 「硬件或 ACPI 坏了」 | 先查 kext 是不是被自己关掉了 |
+| 摄像头能枚举但 0 帧 | 「摄像头坏了 / UVC 不兼容」 | 先查是不是装着 `XHCILagFix`：它把 iso 传输一起重定向，iso 永不完成；换 `XhciNudge` 后立刻出图（README §3.4） |
+| 第三方 App 提示「请到系统设置里授权」，但列表里没有这个 App | 「TCC 数据库坏了，要重装系统 / 关 SIP」 | 该列表只显示成功请求过的 App，不能手工添加；真正原因是 `amfi` 被关后 `tccd` 判定「不弹窗」（README §3.9） |
+| `tccutil reset` 做了、库也写了，App 仍然不行 | 「写库无效 / 权限系统坏了」 | `tccd` 在**进程启动时**读授权，必须 ⌘Q 完全退出 App 再打开；内存里的旧结果不会自己刷新 |
+| Photo Booth 主窗黑，但菜单栏小窗有画面、拍照正常 | 「摄像头不通 / 权限没给」 | 采集与解码都正常，缺的是预览层纹理的 `ShaderWrite`，属 NullMoth 上游 bug #585（README §3.10） |
 | `diskutil mount` 报 volume damaged | 「ESP 文件系统损坏」 | `fsck_msdos -n` 往往无错误，用底层 `mount -t msdos` 即可 |
 | `SetupVirtualMap=False` 后能进一次 | 「找到 AMD 固件修复了」 | 该值在本机 True/False 都成功过也都挂过，非决定变量 |
 | Recovery 也卡死 | 「系统卷坏了」 | Recovery 同样会注入第三方 kext，只能排除系统卷，不能排除 kext |
@@ -431,3 +435,46 @@ sudo chmod 744 /Library/KernelCollections/AuxiliaryKernelExtensions.kc
 - 如果 **picker 能显示、但进系统后黑屏 / 无 Metal**：本节
 - 如果 **画面正常、只是随机起不来**：§3 slide 抽签
 - 如果 **Type-C 接外接屏没信号**：物理 MUX 切断，无解，见 README §3.8，不要试图靠改显卡驱动解决
+
+---
+
+## 12. 摄像头 / USB / 第三方 App 权限速查
+
+「摄像头用不了」在这一台机器上有**三种完全不同的成因**，先分层再动手，否则一定绕圈。
+
+| 层 | 典型症状 | 一眼判据 | 去哪儿 |
+|---|---|---|---|
+| ① 驱动 / USB iso | 设备能枚举，但 0 帧；所有 App 都没画面 | `system_profiler SPCameraDataType` 能看到 `ACER HD User Facing` | README §3.4 / §3.7 |
+| ② 权限（TCC） | App 弹自己的「请去设置授权」，系统**不弹窗**，设置列表里没有它 | `tccd` 日志出现 `Policy disallows prompt` | README §3.9 |
+| ③ App 自身渲染 | 只有某一个 App 的预览黑，其他 App 正常 | Photo Booth 主窗黑、小窗正常 | README §3.10 |
+
+### 12.1 三条一分钟命令（先定性）
+
+```bash
+# ① 设备在不在
+system_profiler SPCameraDataType | head -8
+
+# ② USB 驱动是哪一代（XHCILagFix 会废掉摄像头）
+kmutil showloaded --list-only | grep -iE "xhcinudge|xhcilag"
+
+# ③ 权限库里有什么
+sqlite3 "$HOME/Library/Application Support/com.apple.TCC/TCC.db" \
+  "select service,client,auth_value,auth_reason from access where service like '%Camera%';"
+```
+
+### 12.2 抓 tccd 日志的正确姿势
+
+`amfi` 被关掉后，远程 zsh 里的 `log` 可能是 alias，必须走绝对路径；另外这台机器的 logd 时间戳与系统时钟有偏移，`--last/--start` 滤镜不可靠，**先导出再 grep**：
+
+```bash
+/usr/bin/log show --last 40m --predicate 'process == "tccd"' --info --style compact > /tmp/tccd.txt
+grep "Policy disallows prompt" /tmp/tccd.txt | grep -oE 'identifier=[a-zA-Z0-9._-]+' | sort | uniq -c | sort -rn
+```
+
+看到 `CS_PLATFORM_BINARY set but not AppleSigned; prompt policy is Deny` 就是第 ② 层，去 README §3.9 用 `tccgrant` 写库；**写完必须 ⌘Q 重启 App**，验证是日志里出现 `Allowed (User Consent)`。
+
+### 12.3 三个不要
+
+1. **不要**为了救摄像头去调 `XHCILagFix` 的各种开关 —— 它的 iso 缺陷是结构性的，换 `XhciNudge` 才是正解。
+2. **不要**反复 `tccutil reset Camera` —— 在 `amfi` 关闭的机器上它不会让弹窗出现，只会浪费一轮重启。
+3. **不要**用 `AMFIPass.kext + -amfipassbeta` 替代两个 `amfi` 参数 —— 本机 macOS 26.7.2 + NullMoth 3.0 实测：kext 能加载，但 `WindowServer` 在 `CoreDisplay_CreateDisplayForCGXDisplayDevice` 处断言崩溃，直接黑屏（原因见 README §3.9 末）。回滚前记得清 `nullmoth-nv-starts` 计数。
